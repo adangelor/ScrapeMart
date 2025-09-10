@@ -5,6 +5,7 @@ namespace ScrapeMart.Entities
     public sealed class Product
     {
         public int Id { get; set; }
+        public string RetailerHost { get; set; } = default!; // <-- ¡CAMPO AÑADIDO!
         public string ProductId { get; set; } = default!;
         public string? ProductName { get; set; }
         public string? Brand { get; set; }
@@ -14,7 +15,6 @@ namespace ScrapeMart.Entities
         public DateTime? ReleaseDateUtc { get; set; }
         public string? CacheId { get; set; }
         public string? CategoryId { get; set; }
-
         public string? RawJson { get; set; }
 
         [JsonIgnore] public ICollection<Sku> Skus { get; set; } = new List<Sku>();

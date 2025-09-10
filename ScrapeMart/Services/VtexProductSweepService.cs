@@ -11,6 +11,12 @@ public sealed class VtexProductSweepService
     private readonly IHttpClientFactory _http;
     private readonly string _sqlConn;
 
+    private static readonly JsonSerializerOptions Jso = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = JsonNumberHandling.AllowReadingFromString
+    };
+
     public VtexProductSweepService(IHttpClientFactory http, IConfiguration cfg)
     {
         _http = http;
@@ -25,25 +31,22 @@ public sealed class VtexProductSweepService
         int to = 99,
         int step = 50,
         int? sc = null,
+        int freshnessHours = 12,
+        bool ignoreFreshness = false,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(host)) throw new ArgumentException("host is required", nameof(host));
         if (ft is null && categoryId is null) throw new ArgumentException("Provide ft or categoryId");
 
-        var http = _http.CreateClient();
-        http.Timeout = TimeSpan.FromSeconds(30);
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("ScrapeMart/1.0 (+VTEX product sweep)");
+        var http = _http.CreateClient("vtexSession");
+        http.Timeout = TimeSpan.FromSeconds(90);
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
         http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         var totalRequests = 0;
         var totalProducts = 0;
+        var skippedProducts = 0;
         var lastHttp = 0;
-
-        var options = new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true,
-            NumberHandling = JsonNumberHandling.AllowReadingFromString
-        };
 
         for (int start = from; start <= to; start += step)
         {
@@ -67,33 +70,47 @@ public sealed class VtexProductSweepService
 
             await InsertDiscoveryAsync(host, categoryId is null ? "ft" : "category", categoryId?.ToString() ?? ft!, start, end, lastHttp, json, ct);
 
-            if (!resp.IsSuccessStatusCode) continue;
+            if (!resp.IsSuccessStatusCode)
+            {
+                break;
+            }
 
             VtexProduct[]? products = null;
             try
             {
-                products = JsonSerializer.Deserialize<VtexProduct[]>(json, options);
+                products = JsonSerializer.Deserialize<VtexProduct[]>(json, Jso);
             }
-            catch
-            {
-                // keep going; discovery already stored
-            }
+            catch { /* Ignoramos error de parseo, ya se guardó el discovery */ }
+
             if (products is null || products.Length == 0) break;
+
+            var recentlyUpdatedIds = new HashSet<int>();
+            if (!ignoreFreshness)
+            {
+                var productIdsInPage = products.Select(p => SafeInt(p.ProductId)).Where(id => id != 0).ToList();
+                recentlyUpdatedIds = await GetRecentlyUpdatedProductIdsAsync(host, productIdsInPage, freshnessHours, ct);
+            }
 
             foreach (var p in products)
             {
+                var productIdInt = SafeInt(p.ProductId);
+                if (productIdInt == 0) continue;
+
+                if (recentlyUpdatedIds.Contains(productIdInt))
+                {
+                    skippedProducts++;
+                    continue;
+                }
+
                 await UpsertProductAsync(host, p, ct);
                 if (p.Items is null) continue;
                 foreach (var it in p.Items)
                 {
                     await UpsertSkuAsync(host, p, it, ct);
-
                     if (it.Images is { Count: > 0 })
                     {
-                        foreach (var img in it.Images)
-                            await UpsertSkuImageAsync(host, it, img, ct);
+                        foreach (var img in it.Images) await UpsertSkuImageAsync(host, it, img, ct);
                     }
-
                     if (it.Sellers is { Count: > 0 })
                     {
                         foreach (var s in it.Sellers)
@@ -107,7 +124,7 @@ public sealed class VtexProductSweepService
             }
 
             totalProducts += products.Length;
-            if (products.Length < step) break; // VTEX usually returns <= page size at end
+            if (products.Length < step) break;
         }
 
         return new SweepResult
@@ -115,18 +132,41 @@ public sealed class VtexProductSweepService
             Host = host,
             TotalRequests = totalRequests,
             TotalProductsParsed = totalProducts,
+            SkippedAsFresh = skippedProducts,
             LastHttpStatus = lastHttp
         };
+    }
+
+    private async Task<HashSet<int>> GetRecentlyUpdatedProductIdsAsync(string host, List<int> productIds, int hours, CancellationToken ct)
+    {
+        if (productIds.Count == 0) return new HashSet<int>();
+
+        var sql = $@"
+SELECT ProductId FROM dbo.VtexProducts
+WHERE RetailerHost = @host
+AND ProductId IN ({string.Join(",", productIds)})
+AND LastSeenUtc >= DATEADD(hour, -@hours, SYSUTCDATETIME());";
+
+        var foundIds = new HashSet<int>();
+        await using var cn = new SqlConnection(_sqlConn);
+        await cn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.AddWithValue("@host", host);
+        cmd.Parameters.AddWithValue("@hours", hours);
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            foundIds.Add(reader.GetInt32(0));
+        }
+        return foundIds;
     }
 
     private async Task InsertDiscoveryAsync(string host, string queryType, string queryValue, int from, int to, int httpStatus, string rawJson, CancellationToken ct)
     {
         const string sql = @"
-INSERT INTO dbo.VtexCatalogDiscovery
-    (RetailerHost, QueryType, QueryValue, RangeFrom, RangeTo, HttpStatus, ItemsFound, RawJson, CapturedAtUtc)
-VALUES
-    (@host, @type, @value, @from, @to, @status, NULL, @raw, SYSUTCDATETIME());";
-
+INSERT INTO dbo.VtexCatalogDiscovery (RetailerHost, QueryType, QueryValue, RangeFrom, RangeTo, HttpStatus, RawJson)
+VALUES (@host, @type, @value, @from, @to, @status, @raw);";
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, cn);
@@ -146,17 +186,9 @@ VALUES
 MERGE dbo.VtexProducts AS T
 USING (SELECT @host AS RetailerHost, @pid AS ProductId) AS S
 ON (T.RetailerHost=S.RetailerHost AND T.ProductId=S.ProductId)
-WHEN MATCHED THEN UPDATE SET
-    ProductName=@name,
-    Brand=@brand,
-    LinkText=@link,
-    Categories=@cats,
-    LastSeenUtc=SYSUTCDATETIME()
-WHEN NOT MATCHED THEN INSERT
-    (RetailerHost, ProductId, ProductName, Brand, LinkText, Categories, FirstSeenUtc, LastSeenUtc)
-VALUES
-    (@host, @pid, @name, @brand, @link, @cats, SYSUTCDATETIME(), SYSUTCDATETIME());";
-
+WHEN MATCHED THEN UPDATE SET ProductName=@name, Brand=@brand, LinkText=@link, Categories=@cats, LastSeenUtc=SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (RetailerHost, ProductId, ProductName, Brand, LinkText, Categories, FirstSeenUtc, LastSeenUtc)
+VALUES (@host, @pid, @name, @brand, @link, @cats, SYSUTCDATETIME(), SYSUTCDATETIME());";
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, cn);
@@ -175,19 +207,9 @@ VALUES
 MERGE dbo.VtexSkus AS T
 USING (SELECT @host AS RetailerHost, @sid AS SkuId) AS S
 ON (T.RetailerHost=S.RetailerHost AND T.SkuId=S.SkuId)
-WHEN MATCHED THEN UPDATE SET
-    ProductId=@pid,
-    SkuName=@name,
-    Ean=@ean,
-    RefId=@ref,
-    MeasurementUnit=@mu,
-    UnitMultiplier=@um,
-    LastSeenUtc=SYSUTCDATETIME()
-WHEN NOT MATCHED THEN INSERT
-    (RetailerHost, SkuId, ProductId, SkuName, Ean, RefId, MeasurementUnit, UnitMultiplier, FirstSeenUtc, LastSeenUtc)
-VALUES
-    (@host, @sid, @pid, @name, @ean, @ref, @mu, @um, SYSUTCDATETIME(), SYSUTCDATETIME());";
-
+WHEN MATCHED THEN UPDATE SET ProductId=@pid, SkuName=@name, Ean=@ean, RefId=@ref, MeasurementUnit=@mu, UnitMultiplier=@um, LastSeenUtc=SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (RetailerHost, SkuId, ProductId, SkuName, Ean, RefId, MeasurementUnit, UnitMultiplier, FirstSeenUtc, LastSeenUtc)
+VALUES (@host, @sid, @pid, @name, @ean, @ref, @mu, @um, SYSUTCDATETIME(), SYSUTCDATETIME());";
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, cn);
@@ -208,13 +230,9 @@ VALUES
 MERGE dbo.VtexSkuImages AS T
 USING (SELECT @host AS RetailerHost, @sid AS SkuId, @imgId AS ImageId) AS S
 ON (T.RetailerHost=S.RetailerHost AND T.SkuId=S.SkuId AND T.ImageId=S.ImageId)
-WHEN MATCHED THEN UPDATE SET
-    Url=@url, ImageLabel=@label, ImageText=@text, LastSeenUtc=SYSUTCDATETIME()
-WHEN NOT MATCHED THEN INSERT
-    (RetailerHost, SkuId, ImageId, Url, ImageLabel, ImageText, FirstSeenUtc, LastSeenUtc)
-VALUES
-    (@host, @sid, @imgId, @url, @label, @text, SYSUTCDATETIME(), SYSUTCDATETIME());";
-
+WHEN MATCHED THEN UPDATE SET Url=@url, ImageLabel=@label, ImageText=@text, LastSeenUtc=SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (RetailerHost, SkuId, ImageId, Url, ImageLabel, ImageText, FirstSeenUtc, LastSeenUtc)
+VALUES (@host, @sid, @imgId, @url, @label, @text, SYSUTCDATETIME(), SYSUTCDATETIME());";
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, cn);
@@ -233,15 +251,9 @@ VALUES
 MERGE dbo.VtexSkuSellers AS T
 USING (SELECT @host AS RetailerHost, @sid AS SkuId, @seller AS SellerId) AS S
 ON (T.RetailerHost=S.RetailerHost AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId)
-WHEN MATCHED THEN UPDATE SET
-    SellerName=@name,
-    SellerDefault=@def,
-    LastSeenUtc=SYSUTCDATETIME()
-WHEN NOT MATCHED THEN INSERT
-    (RetailerHost, SkuId, SellerId, SellerName, SellerDefault, FirstSeenUtc, LastSeenUtc)
-VALUES
-    (@host, @sid, @seller, @name, @def, SYSUTCDATETIME(), SYSUTCDATETIME());";
-
+WHEN MATCHED THEN UPDATE SET SellerName=@name, SellerDefault=@def, LastSeenUtc=SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (RetailerHost, SkuId, SellerId, SellerName, SellerDefault, FirstSeenUtc, LastSeenUtc)
+VALUES (@host, @sid, @seller, @name, @def, SYSUTCDATETIME(), SYSUTCDATETIME());";
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, cn);
@@ -256,11 +268,8 @@ VALUES
     private async Task InsertOfferAsync(string host, VtexItem it, VtexSeller s, int? sc, CancellationToken ct)
     {
         const string sql = @"
-INSERT INTO dbo.VtexOffers
-    (RetailerHost, SkuId, SellerId, SalesChannel, Price, ListPrice, PriceWithoutDiscount, AvailableQuantity, IsAvailable, PriceValidUntilUtc, CapturedAtUtc)
-VALUES
-    (@host, @sid, @seller, @sc, @price, @list, @pwd, @qty, @avail, @valid, SYSUTCDATETIME());";
-
+INSERT INTO dbo.VtexOffers (RetailerHost, SkuId, SellerId, SalesChannel, Price, ListPrice, PriceWithoutDiscount, AvailableQuantity, IsAvailable, PriceValidUntilUtc)
+VALUES (@host, @sid, @seller, @sc, @price, @list, @pwd, @qty, @avail, @valid);";
         var o = s.CommertialOffer!;
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
@@ -278,9 +287,7 @@ VALUES
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    private static int SafeInt(string? s) =>
-        int.TryParse(s, out var i) ? i : 0;
-
+    private static int SafeInt(string? s) => int.TryParse(s, out var i) ? i : 0;
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max];
 
     public sealed class SweepResult
@@ -288,65 +295,16 @@ VALUES
         public string Host { get; set; } = default!;
         public int TotalRequests { get; set; }
         public int TotalProductsParsed { get; set; }
+        public int SkippedAsFresh { get; set; }
         public int LastHttpStatus { get; set; }
     }
 
     #region POCOs
-
-    public sealed class VtexProduct
-    {
-        public string? ProductId { get; set; }
-        public string? ProductName { get; set; }
-        public string? Brand { get; set; }
-        public string[]? Categories { get; set; }
-        public string? LinkText { get; set; }
-        public List<VtexItem>? Items { get; set; }
-    }
-
-    public sealed class VtexItem
-    {
-        public string? ItemId { get; set; }
-        public string? Name { get; set; }
-        public string? Ean { get; set; }
-        public List<ReferenceId>? ReferenceId { get; set; }
-        public string? MeasurementUnit { get; set; }
-        public decimal? UnitMultiplier { get; set; }
-        public List<VtexImage>? Images { get; set; }
-        public List<VtexSeller>? Sellers { get; set; }
-    }
-
-    public sealed class ReferenceId
-    {
-        public string? Key { get; set; }
-        public string? Value { get; set; }
-    }
-
-    public sealed class VtexImage
-    {
-        public string? ImageId { get; set; }
-        public string? ImageLabel { get; set; }
-        public string? ImageUrl { get; set; }
-        public string? ImageText { get; set; }
-    }
-
-    public sealed class VtexSeller
-    {
-        public string? SellerId { get; set; }
-        public string? SellerName { get; set; }
-        public bool SellerDefault { get; set; }
-        public CommertialOffer? CommertialOffer { get; set; }
-    }
-
-    public sealed class CommertialOffer
-    {
-        public decimal? Price { get; set; }
-        public decimal? ListPrice { get; set; }
-        public decimal? PriceWithoutDiscount { get; set; }
-        public int? AvailableQuantity { get; set; }
-        public bool? IsAvailable { get; set; }
-        public DateTimeOffset? PriceValidUntil { get; set; }
-    }
-
+    public sealed class VtexProduct { public string? ProductId { get; set; } public string? ProductName { get; set; } public string? Brand { get; set; } public string[]? Categories { get; set; } public string? LinkText { get; set; } public List<VtexItem>? Items { get; set; } }
+    public sealed class VtexItem { public string? ItemId { get; set; } public string? Name { get; set; } public string? Ean { get; set; } public List<ReferenceId>? ReferenceId { get; set; } public string? MeasurementUnit { get; set; } public decimal? UnitMultiplier { get; set; } public List<VtexImage>? Images { get; set; } public List<VtexSeller>? Sellers { get; set; } }
+    public sealed class ReferenceId { public string? Key { get; set; } public string? Value { get; set; } }
+    public sealed class VtexImage { public string? ImageId { get; set; } public string? ImageLabel { get; set; } public string? ImageUrl { get; set; } public string? ImageText { get; set; } }
+    public sealed class VtexSeller { public string? SellerId { get; set; } public string? SellerName { get; set; } public bool SellerDefault { get; set; } public CommertialOffer? CommertialOffer { get; set; } }
+    public sealed class CommertialOffer { public decimal? Price { get; set; } public decimal? ListPrice { get; set; } public decimal? PriceWithoutDiscount { get; set; } public int? AvailableQuantity { get; set; } public bool? IsAvailable { get; set; } public DateTimeOffset? PriceValidUntil { get; set; } }
     #endregion
 }
-

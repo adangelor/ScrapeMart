@@ -3,6 +3,11 @@
     public sealed class Category
     {
         public int Id { get; set; }
+
+        // --- ¡CAMPOS NUEVOS PARA IDENTIFICACIÓN ÚNICA! ---
+        public string RetailerHost { get; set; } = default!;
+        // --- FIN DE CAMPOS NUEVOS ---
+
         public int CategoryId { get; set; }
         public string? Name { get; set; }
         public int? ParentId { get; set; }

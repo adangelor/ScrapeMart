@@ -3,6 +3,7 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using ScrapeMart.Storage;
 
@@ -11,9 +12,11 @@ using ScrapeMart.Storage;
 namespace ScrapeMart.Migrations
 {
     [DbContext(typeof(AppDb))]
-    partial class AppDbModelSnapshot : ModelSnapshot
+    [Migration("20250907121231_RetailersConfig")]
+    partial class RetailersConfig
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -42,19 +45,12 @@ namespace ScrapeMart.Migrations
                     b.Property<int?>("ParentId")
                         .HasColumnType("int");
 
-                    b.Property<string>("RetailerHost")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
-
                     b.HasKey("Id");
 
                     b.HasIndex("CategoryId")
                         .IsUnique();
 
                     b.HasIndex("ParentDbId");
-
-                    b.HasIndex("RetailerHost", "CategoryId")
-                        .IsUnique();
 
                     b.ToTable("Categories");
                 });
@@ -167,16 +163,9 @@ namespace ScrapeMart.Migrations
                     b.Property<DateTime?>("ReleaseDateUtc")
                         .HasColumnType("datetime2");
 
-                    b.Property<string>("RetailerHost")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(450)");
-
                     b.HasKey("Id");
 
                     b.HasIndex("ProductId")
-                        .IsUnique();
-
-                    b.HasIndex("RetailerHost", "ProductId")
                         .IsUnique();
 
                     b.ToTable("Products");
@@ -294,58 +283,6 @@ namespace ScrapeMart.Migrations
                     b.ToTable("Skus");
                 });
 
-            modelBuilder.Entity("ScrapeMart.Entities.Sucursal", b =>
-                {
-                    b.Property<int>("IdBandera")
-                        .HasColumnType("int");
-
-                    b.Property<int>("IdComercio")
-                        .HasColumnType("int");
-
-                    b.Property<int>("IdSucursal")
-                        .HasColumnType("int");
-
-                    b.Property<string>("SucursalesCodigoPostal")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(max)");
-
-                    b.Property<double>("SucursalesLatitud")
-                        .HasColumnType("float");
-
-                    b.Property<double>("SucursalesLongitud")
-                        .HasColumnType("float");
-
-                    b.Property<string>("SucursalesNombre")
-                        .IsRequired()
-                        .HasColumnType("nvarchar(max)");
-
-                    b.HasKey("IdBandera", "IdComercio", "IdSucursal");
-
-                    b.ToTable("Sucursales");
-                });
-
-            modelBuilder.Entity("ScrapeMart.Entities.VtexPickupPoint", b =>
-                {
-                    b.Property<string>("RetailerHost")
-                        .HasColumnType("nvarchar(450)");
-
-                    b.Property<string>("PickupPointId")
-                        .HasColumnType("nvarchar(450)");
-
-                    b.Property<int?>("SourceIdBandera")
-                        .HasColumnType("int");
-
-                    b.Property<int?>("SourceIdComercio")
-                        .HasColumnType("int");
-
-                    b.Property<int?>("SourceIdSucursal")
-                        .HasColumnType("int");
-
-                    b.HasKey("RetailerHost", "PickupPointId");
-
-                    b.ToTable("VtexPickupPoints");
-                });
-
             modelBuilder.Entity("ScrapeMart.Entities.VtexRetailersConfig", b =>
                 {
                     b.Property<int>("Id")
@@ -357,19 +294,31 @@ namespace ScrapeMart.Migrations
                     b.Property<bool>("Enabled")
                         .HasColumnType("bit");
 
+                    b.Property<int>("IdBandera")
+                        .HasColumnType("int");
+
+                    b.Property<int>("IdComercio")
+                        .HasColumnType("int");
+
                     b.Property<string>("RetailerHost")
                         .IsRequired()
-                        .HasColumnType("nvarchar(max)");
+                        .HasMaxLength(255)
+                        .HasColumnType("nvarchar(255)");
 
                     b.Property<string>("RetailerId")
                         .IsRequired()
-                        .HasColumnType("nvarchar(max)");
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
 
                     b.Property<string>("SalesChannels")
                         .IsRequired()
-                        .HasColumnType("nvarchar(max)");
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("RetailerId")
+                        .IsUnique();
 
                     b.ToTable("VtexRetailersConfig");
                 });
