@@ -10,7 +10,7 @@ namespace ScrapeMart.Endpoints
         {
             group.MapGet("/products/{productId}",
                 // PASO 2: AÑADIR [FromServices]
-                async ([FromServices] ICatalogQueryService svc, string productId, CancellationToken ct) =>
+                async ([FromServices] ICatalogQueryService svc, int productId, CancellationToken ct) =>
                 {
                     var res = await svc.GetProductByIdAsync(productId, ct);
                     return res is null ? Results.NotFound() : Results.Ok(res);

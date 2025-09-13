@@ -25,8 +25,7 @@ namespace ScrapeMart.Storage
 
             b.Entity<Product>(e =>
             {
-                e.HasIndex(x => x.ProductId); // Ya no es único, puede repetirse por host
-                e.HasIndex(x => new { x.RetailerHost, x.ProductId }).IsUnique(); // La combinación SÍ es única
+                e.HasIndex(x => new { x.RetailerHost, x.ProductId }).IsUnique(); 
                 e.Property(x => x.RawJson).HasColumnType("nvarchar(max)");
             });
 
@@ -58,6 +57,11 @@ namespace ScrapeMart.Storage
             b.Entity<CommercialOffer>(e =>
             {
                 e.HasOne(x => x.Seller).WithMany(x => x.Offers).HasForeignKey(x => x.SellerDbId);
+                e.Property(x => x.ListPrice).HasColumnType("decimal(18,2)");
+                e.Property(x => x.Price).HasColumnType("decimal(18,2)");
+                e.Property(x => x.SpotPrice).HasColumnType("decimal(18,2)");
+                e.Property(x => x.PriceWithoutDiscount).HasColumnType("decimal(18,2)");
+
             });
 
             b.Entity<ProductProperty>(e =>
@@ -75,16 +79,9 @@ namespace ScrapeMart.Storage
             });
             // --- FIN DE LA CORRECCIÓN ---
 
-
-
-            b.Entity<Product>(e =>
-            {
-                e.HasIndex(x => x.ProductId).IsUnique();
-                e.Property(x => x.RawJson).HasColumnType("nvarchar(max)");
-            });
-
             b.Entity<Sku>(e =>
             {
+                e.Property(x => x.UnitMultiplier).HasColumnType("decimal(18,2)");
                 e.HasIndex(x => x.ItemId).IsUnique();
                 e.HasIndex(x => x.Ean);
                 e.HasOne(x => x.Product).WithMany(x => x.Skus).HasForeignKey(x => x.ProductDbId);

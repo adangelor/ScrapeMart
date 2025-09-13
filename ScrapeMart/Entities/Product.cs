@@ -6,7 +6,7 @@ namespace ScrapeMart.Entities
     {
         public int Id { get; set; }
         public string RetailerHost { get; set; } = default!; // <-- ¡CAMPO AÑADIDO!
-        public string ProductId { get; set; } = default!;
+        public int ProductId { get; set; } = default!;
         public string? ProductName { get; set; }
         public string? Brand { get; set; }
         public int? BrandId { get; set; }

@@ -5,7 +5,7 @@ namespace ScrapeMart.Services
 {
     public interface ICatalogQueryService
     {
-        Task<ProductDto?> GetProductByIdAsync(string productId, CancellationToken ct = default);
+        Task<ProductDto?> GetProductByIdAsync(int productId, CancellationToken ct = default);
         Task<SkuWithProductDto?> GetSkuByEanAsync(string ean, CancellationToken ct = default);
         Task<PagedResult<ProductListItemDto>> GetProductsByCategoryAsync(int categoryId, int page, int pageSize, CancellationToken ct = default);
         Task<IReadOnlyList<CategoryNodeDto>> GetCategoryBreadcrumbAsync(int categoryId, CancellationToken ct = default);
@@ -19,7 +19,7 @@ namespace ScrapeMart.Services
 
         public CatalogQueryService(AppDb db) => _db = db;
 
-        public async Task<ProductDto?> GetProductByIdAsync(string productId, CancellationToken ct = default)
+        public async Task<ProductDto?> GetProductByIdAsync(int productId, CancellationToken ct = default)
         {
             var dto = await _db.Products.AsNoTracking()
                 .Where(p => p.ProductId == productId)
@@ -261,7 +261,7 @@ namespace ScrapeMart.Services
                 .Where(p =>
                     (p.ProductName != null && EF.Functions.Like(p.ProductName, $"%{query}%")) ||
                     (p.Brand != null && EF.Functions.Like(p.Brand, $"%{query}%")) ||
-                    (p.ProductId != null && EF.Functions.Like(p.ProductId, $"%{query}%")) ||
+                    (p.ProductId != null && EF.Functions.Like(p.ProductId.ToString(), $"%{query}%")) ||
                     p.Skus.Any(s => s.Ean != null && s.Ean.Contains(query))
                 );
 
@@ -324,7 +324,7 @@ namespace ScrapeMart.Services
     public sealed class ProductHeadDto
     {
         public int ProductDbId { get; set; }
-        public string ProductId { get; set; } = default!;
+        public int ProductId { get; set; } = default!;
         public string? ProductName { get; set; }
         public string? Brand { get; set; }
         public int? BrandId { get; set; }
@@ -333,7 +333,7 @@ namespace ScrapeMart.Services
     public sealed class ProductListItemDto
     {
         public int ProductDbId { get; set; }
-        public string ProductId { get; set; } = default!;
+        public int ProductId { get; set; } = default!;
         public string? ProductName { get; set; }
         public string? Brand { get; set; }
         public int? BrandId { get; set; }
@@ -345,7 +345,7 @@ namespace ScrapeMart.Services
     public sealed class ProductDto
     {
         public int ProductDbId { get; set; }
-        public string ProductId { get; set; } = default!;
+        public int ProductId { get; set; } = default!;
         public string? ProductName { get; set; }
         public string? Brand { get; set; }
         public int? BrandId { get; set; }

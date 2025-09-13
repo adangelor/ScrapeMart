@@ -18,7 +18,7 @@ builder.Services.Configure<VtexOptions>(builder.Configuration.GetSection("Vtex")
 builder.Services.AddHttpClient<VtexCatalogClient>();
 builder.Services.AddDbContext<AppDb>(o =>
     o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
-
+builder.Services.AddScoped<VtexToProductsTranscriberService>();
 builder.Services.AddHttpClient("vtexSession")
     .ConfigurePrimaryHttpMessageHandler(() =>
     {
@@ -73,14 +73,34 @@ app.MapPost("/ops/vtex/full-availability-probe", async (
     string host,
     CancellationToken ct) =>
 {
-    // Esta es una operación de larga duración. No la esperes, se ejecuta en segundo plano.
-    _ = orchestrator.ProbeAllAsync(host, ct);
-    return Results.Accepted(value: new { message = "Proceso de sondeo masivo iniciado en segundo plano." });
+    try
+    {
+        // Ejecutamos el sondeo de forma síncrona para poder debuggear
+        await orchestrator.ProbeAllAsync(host, ct);
+
+        return Results.Ok(new
+        {
+            message = "Proceso de sondeo masivo completado exitosamente.",
+            timestamp = DateTime.UtcNow
+        });
+    }
+    catch (Exception ex)
+    {
+        // Capturamos cualquier excepción para debugging
+        return Results.Problem(
+            detail: ex.Message,
+            title: "Error en el sondeo masivo",
+            statusCode: 500,
+            extensions: new Dictionary<string, object?>
+            {
+                ["exception"] = ex.ToString(),
+                ["timestamp"] = DateTime.UtcNow
+            });
+    }
 })
 .WithTags("Operations")
-.WithSummary("Orquesta el sondeo masivo de disponibilidad para todos los SKUs y sucursales de un retailer.");
-// --- FIN DEL NUEVO ENDPOINT ---
-
+.WithSummary("Orquesta el sondeo masivo de disponibilidad para todos los SKUs y sucursales de un retailer (modo debugging).");
+// --- FIN DEL ENDPOINT MODIFICADO PARA DEBUGGING ---
 
 app.MapPost("/ops/vtex/full-catalog-sweep", async (
     [FromServices] CatalogOrchestratorService orchestrator,

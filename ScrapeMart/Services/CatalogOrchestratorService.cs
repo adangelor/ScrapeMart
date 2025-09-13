@@ -6,18 +6,12 @@ namespace ScrapeMart.Services;
 /// <summary>
 /// Servicio de alto nivel para orquestar operaciones complejas de barrido y sincronización.
 /// </summary>
-public sealed class CatalogOrchestratorService
+public sealed class CatalogOrchestratorService(
+    IServiceProvider serviceProvider,
+    ILogger<CatalogOrchestratorService> log)
 {
-    private readonly IServiceProvider _serviceProvider;
-    private readonly ILogger<CatalogOrchestratorService> _log;
-
-    public CatalogOrchestratorService(
-        IServiceProvider serviceProvider,
-        ILogger<CatalogOrchestratorService> log)
-    {
-        _serviceProvider = serviceProvider;
-        _log = log;
-    }
+    private readonly IServiceProvider _serviceProvider = serviceProvider;
+    private readonly ILogger<CatalogOrchestratorService> _log = log;
 
     /// <summary>
     /// Ejecuta el proceso completo de sincronización de catálogo para un retailer.
@@ -68,15 +62,13 @@ public sealed class CatalogOrchestratorService
 
                 try
                 {
-                    // --- ¡CORRECCIÓN CLAVE AQUÍ! ---
-                    // Ahora llamamos al servicio correcto (CatalogSyncService) para que guarde los productos.
                     var (total, upserts) = await syncService.SyncProductsAsync(
                         host: host,
                         categoryId: categoryId,
                         pageSize: 50,
                         maxPages: null, // Dejamos que el servicio decida cuándo parar
                         ct: ct);
-                    // --- FIN DE LA CORRECCIÓN ---
+                    
 
                     summary.TotalProductsFound += total;
                 }
@@ -86,6 +78,9 @@ public sealed class CatalogOrchestratorService
                     summary.FailedCategories++;
                 }
             }
+            var transcriber = serviceProvider.GetRequiredService<VtexToProductsTranscriberService>();
+            var result = await transcriber.TranscribeProductsAsync(host, 100, ct);
+
         }
         catch (Exception ex)
         {

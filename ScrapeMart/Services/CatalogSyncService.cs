@@ -6,19 +6,12 @@ using System.Text.Json.Nodes;
 
 namespace ScrapeMart.Services
 {
-    public sealed class CatalogSyncService
+    public sealed class CatalogSyncService(AppDb db, VtexCatalogClient client, ILogger<CatalogSyncService> log)
     {
-        // ... (el constructor queda igual) ...
-        private readonly AppDb _db;
-        private readonly VtexCatalogClient _client;
-        private readonly ILogger<CatalogSyncService> _log;
-
-        public CatalogSyncService(AppDb db, VtexCatalogClient client, ILogger<CatalogSyncService> log)
-        {
-            _db = db;
-            _client = client;
-            _log = log;
-        }
+        
+        private readonly AppDb _db = db;
+        private readonly VtexCatalogClient _client = client;
+        private readonly ILogger<CatalogSyncService> _log = log;
 
         public async Task<int> SyncCategoriesAsync(string host, int categoryTreeDepth, CancellationToken ct)
         {
@@ -38,8 +31,6 @@ namespace ScrapeMart.Services
             }
             Walk(tree, null);
 
-            // --- LÓGICA CORREGIDA ---
-            // Buscamos las categorías que ya existen PERO SOLO PARA ESTE HOST
             var map = await _db.Categories.Where(c => c.RetailerHost == host).ToDictionaryAsync(x => x.CategoryId, x => x, ct);
             foreach (var (id, name, parentId) in flat)
             {
@@ -65,8 +56,7 @@ namespace ScrapeMart.Services
             return flat.Count;
         }
 
-        // El resto de la clase (SyncProductsAsync y los helpers) queda igual
-        public async Task<(int total, int upserts)> SyncProductsAsync(string host, int? categoryId, int pageSize, int? maxPages, CancellationToken ct)
+           public async Task<(int total, int upserts)> SyncProductsAsync(string host, int? categoryId, int pageSize, int? maxPages, CancellationToken ct)
         {
             var totalProducts = 0;
             var upserts = 0;
@@ -78,17 +68,15 @@ namespace ScrapeMart.Services
             }
             else
             {
-                // --- CORRECCIÓN ---
-                // Buscamos las categorías solo del host actual
-                categories = await _db.Categories.Where(c => c.RetailerHost == host).Select(c => c.CategoryId).ToListAsync(ct);
+                       categories = await _db.Categories.Where(c => c.RetailerHost == host).Select(c => c.CategoryId).ToListAsync(ct);
             }
 
             foreach (var cid in categories)
             {
                 await foreach (var prod in _client.GetProductsByCategoryAsync(host, cid, pageSize, maxPages, ct))
                 {
-                    var pid = prod["productId"]?.ToString() ?? "";
-                    if (string.IsNullOrEmpty(pid)) continue;
+                    if(prod["productId"] == null || !int.TryParse(prod["productId"].ToString(), out int pid))
+                    continue;
 
                     var p = await _db.Products.Include(x => x.ProductCategories)
                                               .FirstOrDefaultAsync(x => x.RetailerHost == host && x.ProductId == pid, ct);
