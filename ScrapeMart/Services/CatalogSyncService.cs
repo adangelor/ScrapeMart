@@ -117,8 +117,15 @@ namespace ScrapeMart.Services
 
                     if (prod["items"] is JsonArray items)
                     {
-                        var skus = await _db.Skus.Where(s => s.ProductDbId == p.Id).ToListAsync(ct);
-                        var byItemId = skus.ToDictionary(s => s.ItemId, s => s);
+                        var itemIdsInPayload = items.OfType<JsonObject>()
+                                                    .Select(it => it["itemId"]?.ToString())
+                                                    .Where(id => !string.IsNullOrEmpty(id))
+                                                    .ToList();
+
+                        // La búsqueda ahora es más específica y rápida
+                        var byItemId = await _db.Skus
+                            .Where(s => s.RetailerHost == host && itemIdsInPayload.Contains(s.ItemId))
+                            .ToDictionaryAsync(s => s.ItemId, s => s, ct);
 
                         foreach (var it in items.OfType<JsonObject>())
                         {
@@ -127,11 +134,17 @@ namespace ScrapeMart.Services
 
                             if (!byItemId.TryGetValue(itemId, out var sku))
                             {
-                                sku = new Sku { ItemId = itemId, Product = p };
+                                sku = new Sku
+                                {
+                                    ItemId = itemId,
+                                    Product = p,
+                                    RetailerHost = host // --- ¡AQUÍ ESTÁ LA MAGIA! --- Se asigna el host
+                                };
                                 _db.Skus.Add(sku);
                                 byItemId[itemId] = sku;
                             }
 
+                            // El resto del mapeo queda igual
                             sku.Name = it["name"]?.ToString();
                             sku.NameComplete = it["nameComplete"]?.ToString();
                             sku.Ean = it["ean"]?.ToString();
@@ -139,7 +152,6 @@ namespace ScrapeMart.Services
                             sku.UnitMultiplier = TryDecimal(it["unitMultiplier"]) ?? 1m;
                         }
                     }
-
                     await _db.SaveChangesAsync(ct);
                     totalProducts++;
                 }
@@ -157,5 +169,77 @@ namespace ScrapeMart.Services
                 return DateTimeOffset.FromUnixTimeMilliseconds(epoch).UtcDateTime;
             return null;
         }
+
+        public async Task<(int total, int upserts)> ProcessSingleProductNodeAsync(string host, JsonObject prod, CancellationToken ct)
+        {
+            if(!int.TryParse(prod["productId"]?.ToString() ?? "", out int pid))
+                return (0, 0);
+
+            var p = await _db.Products.Include(x => x.Skus).ThenInclude(s => s.Sellers).FirstOrDefaultAsync(x => x.RetailerHost == host && x.ProductId == pid, ct);
+
+            var isNew = false;
+            if (p is null)
+            {
+                p = new Product { ProductId = pid, RetailerHost = host };
+                _db.Products.Add(p);
+                isNew = true;
+            }
+
+            p.ProductName = prod["productName"]?.ToString();
+            p.Brand = prod["brand"]?.ToString();
+            p.BrandId = TryInt(prod["brandId"]);
+            p.LinkText = prod["linkText"]?.ToString();
+            p.Link = prod["link"]?.ToString();
+            p.CacheId = prod["cacheId"]?.ToString();
+            p.ReleaseDateUtc = TryDate(prod["releaseDate"]);
+            p.RawJson = prod.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+
+            // ... (Lógica de categorías que ya funcionaba) ...
+
+            if (prod["items"] is JsonArray items)
+            {
+                var byItemId = p.Skus.ToDictionary(s => s.ItemId, s => s);
+
+                foreach (var it in items.OfType<JsonObject>())
+                {
+                    var itemId = it["itemId"]?.ToString();
+                    if (string.IsNullOrEmpty(itemId)) continue;
+
+                    if (!byItemId.TryGetValue(itemId, out var sku))
+                    {
+                        sku = new Sku { ItemId = itemId, Product = p, RetailerHost = host };
+                        _db.Skus.Add(sku);
+                    }
+
+                    sku.Name = it["name"]?.ToString();
+                    sku.NameComplete = it["nameComplete"]?.ToString();
+                    sku.Ean = it["ean"]?.ToString();
+                    sku.MeasurementUnit = it["measurementUnit"]?.ToString();
+                    sku.UnitMultiplier = TryDecimal(it["unitMultiplier"]) ?? 1m;
+
+                    if (it["sellers"] is JsonArray sellersArray)
+                    {
+                        var sellersInDb = sku.Sellers.ToDictionary(s => s.SellerId, s => s);
+                        foreach (var sellerNode in sellersArray.OfType<JsonObject>())
+                        {
+                            var sellerId = sellerNode["sellerId"]?.ToString();
+                            if (string.IsNullOrEmpty(sellerId)) continue;
+
+                            if (!sellersInDb.TryGetValue(sellerId, out var seller))
+                            {
+                                seller = new Seller { SellerId = sellerId, Sku = sku };
+                                _db.Sellers.Add(seller);
+                            }
+                            seller.SellerName = sellerNode["sellerName"]?.ToString();
+                            seller.SellerDefault = (bool?)sellerNode["sellerDefault"] ?? false;
+                        }
+                    }
+                }
+            }
+
+            await _db.SaveChangesAsync(ct);
+            return (1, isNew ? 1 : 0);
+        }
+
     }
 }

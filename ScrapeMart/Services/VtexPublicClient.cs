@@ -68,6 +68,10 @@ public sealed class VtexPublicClient
     {
         public double[]? GeoCoordinates => Lon.HasValue && Lat.HasValue ? new[] { Lon.Value, Lat.Value } : null;
     }
+    public sealed record SkuIdentifier(string Id, string Seller, int Quantity = 1);
+    public sealed record MultiSimResult(string Raw, Dictionary<string, SimResultItem> Items);
+    public sealed record SimResultItem(bool Available, decimal? Price, decimal? ListPrice);
+
 
     public sealed record SellerDto(string Id, string? Name);
 
@@ -443,5 +447,73 @@ public sealed class VtexPublicClient
     {
         if (_host is null) throw new InvalidOperationException("Este método requiere que el cliente tenga Host configurado.");
         return SimulatePickupAsync(GetClient(), _host, salesChannel, skuId, quantity, sellerId, countryCode, postalCode, geo, pickupPointId, ct);
+    }
+
+    public async Task<MultiSimResult> SimulateMultiSkuPickupAsync(
+    HttpClient http,
+    string host,
+    int salesChannel,
+    IEnumerable<SkuIdentifier> skus,
+    string countryCode,
+    string? postalCode,
+    string pickupPointId,
+    CancellationToken ct = default)
+    {
+        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
+        var cc = NormalizeCountry(countryCode);
+
+        var itemsPayload = skus.Select((sku, index) => new {
+            id = sku.Id,
+            quantity = sku.Quantity,
+            seller = sku.Seller,
+            itemIndex = index // Necesario para el mapeo
+        }).ToList();
+
+        var logisticsInfoPayload = itemsPayload.Select(item => new {
+            itemIndex = item.itemIndex,
+            selectedSla = pickupPointId,
+            selectedDeliveryChannel = "pickup-in-point"
+        }).ToList();
+
+        var body = new
+        {
+            items = itemsPayload.Select(p => new { p.id, p.quantity, p.seller }).ToList(),
+            postalCode,
+            country = cc,
+            shippingData = new { logisticsInfo = logisticsInfoPayload }
+        };
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(body, _json), Encoding.UTF8, "application/json")
+        };
+
+        using var resp = await http.SendAsync(req, ct);
+        var raw = await resp.Content.ReadAsStringAsync(ct);
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            throw new VtexHttpException("Multi-SKU Pickup simulation failed", resp.StatusCode, raw, new { pickupPointId, itemCount = skus.Count() });
+        }
+
+        var results = new Dictionary<string, SimResultItem>();
+        using var doc = JsonDocument.Parse(raw);
+
+        if (doc.RootElement.TryGetProperty("items", out var itemsArray) && itemsArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var itemEl in itemsArray.EnumerateArray())
+            {
+                var skuId = itemEl.TryGetProperty("id", out var idProp) ? idProp.GetString() : null;
+                if (skuId is null) continue;
+
+                var availability = itemEl.TryGetProperty("availability", out var availProp) && availProp.GetString() == "available";
+                var price = itemEl.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spd) ? spd / 100m : (decimal?)null;
+                var listPrice = itemEl.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpd) ? lpd / 100m : (decimal?)null;
+
+                results[skuId] = new SimResultItem(availability, price, listPrice);
+            }
+        }
+
+        return new MultiSimResult(raw, results);
     }
 }

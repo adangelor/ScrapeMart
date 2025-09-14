@@ -18,8 +18,12 @@ namespace ScrapeMart.Storage
         public DbSet<Sucursal> Sucursales => Set<Sucursal>();
         public DbSet<VtexPickupPoint> VtexPickupPoints => Set<VtexPickupPoint>();
 
+        public DbSet<ProductToTrack> ProductsToTrack { get; internal set; }
+
         protected override void OnModelCreating(ModelBuilder b)
         {
+            b.Entity<ProductToTrack>().HasKey(p => p.EAN); // <-- AÑADIR ESTA LÍNEA AL PRINCIPIO
+
             b.Entity<VtexPickupPoint>().HasKey(p => new { p.RetailerHost, p.PickupPointId });
             b.Entity<VtexRetailersConfig>().HasKey(c => c.Id);
 
@@ -31,7 +35,8 @@ namespace ScrapeMart.Storage
 
             b.Entity<Sku>(e =>
             {
-                e.HasIndex(x => x.ItemId).IsUnique();
+                e.HasIndex(x => new { x.RetailerHost, x.ItemId }).IsUnique();
+
                 e.HasIndex(x => x.Ean);
                 e.HasOne(x => x.Product).WithMany(x => x.Skus).HasForeignKey(x => x.ProductDbId);
             });
@@ -123,4 +128,5 @@ namespace ScrapeMart.Storage
             });
         }
     }
+
 }

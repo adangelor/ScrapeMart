@@ -1,94 +1,57 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿// adangelor/scrapemart/ScrapeMart-307ccdf067def25afed98dbbac22027aa38c1af5/ScrapeMart/Services/CatalogOrchestratorService.cs
+using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
 
 namespace ScrapeMart.Services;
 
-/// <summary>
-/// Servicio de alto nivel para orquestar operaciones complejas de barrido y sincronización.
-/// </summary>
-public sealed class CatalogOrchestratorService(
-    IServiceProvider serviceProvider,
-    ILogger<CatalogOrchestratorService> log)
+public sealed class CatalogOrchestratorService
 {
-    private readonly IServiceProvider _serviceProvider = serviceProvider;
-    private readonly ILogger<CatalogOrchestratorService> _log = log;
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<CatalogOrchestratorService> _log;
 
-    /// <summary>
-    /// Ejecuta el proceso completo de sincronización de catálogo para un retailer.
-    /// 1. Sincroniza el árbol de categorías.
-    /// 2. Barre todos los productos de cada categoría encontrada.
-    /// </summary>
+    public CatalogOrchestratorService(
+        IServiceProvider serviceProvider,
+        ILogger<CatalogOrchestratorService> log)
+    {
+        _serviceProvider = serviceProvider;
+        _log = log;
+    }
+
     public async Task<SweepSummary> SweepFullCatalogAsync(string host, int? salesChannel, CancellationToken ct)
     {
         var summary = new SweepSummary(host);
-        _log.LogInformation("Iniciando barrido completo de catálogo para {Host}...", host);
+        _log.LogInformation("Iniciando barrido directo de catálogo para {Host}...", host);
 
-        // Creamos un "scope" de servicios propio para esta tarea de larga duración.
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
         var syncService = scope.ServiceProvider.GetRequiredService<CatalogSyncService>();
 
         try
         {
-            // --- PASO 1: Sincronizar el árbol de categorías ---
+            // Paso 1: Sincronizar categorías (esto es rápido y necesario)
             _log.LogInformation("Sincronizando categorías para {Host}...", host);
             var categoryCount = await syncService.SyncCategoriesAsync(host, 50, ct);
             summary.CategoriesSynced = categoryCount;
-            _log.LogInformation("Se sincronizaron {Count} categorías para {Host}.", categoryCount, host);
+            _log.LogInformation("Se sincronizaron {Count} categorías.", categoryCount);
 
-            // --- PASO 2: Obtener la lista de categorías de nuestra base de datos ---
-            var categoryIds = await db.Categories
-                                      .Where(c => c.RetailerHost == host) // Aseguramos que sean solo las de este host
-                                      .AsNoTracking()
-                                      .Select(c => c.CategoryId)
-                                      .ToListAsync(ct);
+            // Paso 2: Barrer los productos de cada categoría y guardarlos DIRECTAMENTE
+            _log.LogInformation("Iniciando barrido de productos directo a tablas finales...");
+            var (total, upserts) = await syncService.SyncProductsAsync(
+                host: host,
+                categoryId: null, // Pasamos null para que procese TODAS las categorías del host
+                pageSize: 50,
+                maxPages: null,
+                ct: ct);
 
-            summary.TotalCategoriesToSweep = categoryIds.Count;
-            _log.LogInformation("Se barrerán los productos de {Count} categorías.", categoryIds.Count);
-
-            // --- PASO 3: Barrer los productos de cada categoría ---
-            int processedCategories = 0;
-            foreach (var categoryId in categoryIds)
-            {
-                if (ct.IsCancellationRequested)
-                {
-                    _log.LogWarning("La operación de barrido fue cancelada.");
-                    break;
-                }
-
-                processedCategories++;
-                _log.LogInformation("[{Processed}/{Total}] Iniciando barrido de productos para categoría {CategoryId}...",
-                    processedCategories, categoryIds.Count, categoryId);
-
-                try
-                {
-                    var (total, upserts) = await syncService.SyncProductsAsync(
-                        host: host,
-                        categoryId: categoryId,
-                        pageSize: 50,
-                        maxPages: null, // Dejamos que el servicio decida cuándo parar
-                        ct: ct);
-                    
-
-                    summary.TotalProductsFound += total;
-                }
-                catch (Exception ex)
-                {
-                    _log.LogError(ex, "Falló el barrido para la categoría {CategoryId} en {Host}.", categoryId, host);
-                    summary.FailedCategories++;
-                }
-            }
-            var transcriber = serviceProvider.GetRequiredService<VtexToProductsTranscriberService>();
-            var result = await transcriber.TranscribeProductsAsync(host, 100, ct);
-
+            summary.TotalProductsFound = total;
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Falló el proceso de orquestación de barrido para {Host}.", host);
+            _log.LogError(ex, "Falló el proceso de barrido directo para {Host}.", host);
             summary.ErrorMessage = ex.Message;
         }
 
-        _log.LogInformation("Barrido completo para {Host}. Total de productos procesados: {ProductsCount}",
+        _log.LogInformation("Barrido directo para {Host} finalizado. Total de productos procesados: {ProductsCount}",
             host, summary.TotalProductsFound);
         return summary;
     }
@@ -97,10 +60,7 @@ public sealed class CatalogOrchestratorService(
 public sealed record SweepSummary(string Host)
 {
     public int CategoriesSynced { get; set; }
-    public int TotalCategoriesToSweep { get; set; }
     public int TotalProductsFound { get; set; }
-    public int ProductsSkipped { get; set; }
-    public int TotalRequests { get; set; }
-    public int FailedCategories { get; set; }
+    // (Otras propiedades de resumen se pueden quitar si ya no aplican)
     public string? ErrorMessage { get; set; }
 }

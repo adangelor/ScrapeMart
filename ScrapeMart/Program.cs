@@ -37,7 +37,7 @@ builder.Services.AddHttpClient("vtexSession")
     .AddPolicyHandler(HttpPolicyExtensions.HandleTransientHttpError().WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))));
 
 builder.Services.AddHttpClient(nameof(VtexPublicClient));
-
+builder.Services.AddScoped<BrandScrapingService>();
 builder.Services.AddScoped<VtexSweepService>();
 builder.Services.AddScoped<VtexProductSweepService>();
 builder.Services.AddScoped<VtexFulltextCrawler>();
@@ -47,7 +47,7 @@ builder.Services.AddScoped<ICatalogQueryService, CatalogQueryService>();
 builder.Services.AddScoped<CatalogSyncService>();
 builder.Services.AddScoped<CatalogOrchestratorService>();
 builder.Services.AddScoped<AvailabilityOrchestratorService>(); // ¡NUEVO SERVICIO!
-
+builder.Services.AddScoped<TargetedScrapingService>();
 builder.Services.AddSingleton<VtexPublicClient>(serviceProvider =>
 {
     var factory = serviceProvider.GetRequiredService<IHttpClientFactory>();
@@ -67,7 +67,18 @@ app.MapGroup("/api").WithOpenApi().WithTags("Catalog").MapCatalogEndpoints();
 app.MapRetailerAvailabilityEndpoints();
 MapRetailerAvailabilityProbe(app);
 
-// --- ¡NUEVO ENDPOINT PARA EL SONDEO MASIVO! ---
+app.MapPost("/ops/vtex/scrape-tracked-eans", async (
+    string host,
+    [FromServices] TargetedScrapingService scraper,
+    CancellationToken ct) =>
+{
+    // Esta operación puede tardar, la ejecutamos en segundo plano
+    _ = scraper.ScrapeByEanListAsync(host, ct);
+    return Results.Accepted(value: new { message = $"Iniciado el scraping dirigido por EAN para {host}. El proceso se ejecuta en segundo plano." });
+})
+.WithTags("Operations")
+.WithSummary("Busca y guarda en la BD solo los productos de la tabla 'ProductsToTrack' usando su EAN.");
+
 app.MapPost("/ops/vtex/full-availability-probe", async (
     [FromServices] AvailabilityOrchestratorService orchestrator,
     string host,
@@ -100,7 +111,39 @@ app.MapPost("/ops/vtex/full-availability-probe", async (
 })
 .WithTags("Operations")
 .WithSummary("Orquesta el sondeo masivo de disponibilidad para todos los SKUs y sucursales de un retailer (modo debugging).");
-// --- FIN DEL ENDPOINT MODIFICADO PARA DEBUGGING ---
+
+app.MapPost("/ops/vtex/adeco-availability-probe", async (
+    [FromServices] AvailabilityOrchestratorService orchestrator,
+    string host,
+    CancellationToken ct) =>
+{
+    try
+    {
+        
+        await orchestrator.ProbeEanListAsync(host, 42,63, 3, ct);
+
+        return Results.Ok(new
+        {
+            message = "Proceso de sondeo masivo completado exitosamente.",
+            timestamp = DateTime.UtcNow
+        });
+    }
+    catch (Exception ex)
+    {
+        // Capturamos cualquier excepción para debugging
+        return Results.Problem(
+            detail: ex.Message,
+            title: "Error en el sondeo masivo",
+            statusCode: 500,
+            extensions: new Dictionary<string, object?>
+            {
+                ["exception"] = ex.ToString(),
+                ["timestamp"] = DateTime.UtcNow
+            });
+    }
+})
+.WithTags("Operations")
+.WithSummary("Orquesta el sondeo masivo de disponibilidad para todos los SKUs y sucursales de un retailer (modo debugging).");
 
 app.MapPost("/ops/vtex/full-catalog-sweep", async (
     [FromServices] CatalogOrchestratorService orchestrator,
@@ -133,7 +176,16 @@ app.MapPost("/ops/vtex/sweep", async ([FromServices] VtexSweepService svc, strin
     var count = await svc.SweepAsync(host, scList, top, ct);
     return Results.Ok(new { executed = count, scTried = scList, host });
 }).WithTags("Operations");
-
+app.MapPost("/ops/vtex/scrape-by-brand-prefix", async (
+    string host,
+    [FromServices] BrandScrapingService scraper,
+    CancellationToken ct) =>
+{
+    _ = scraper.ScrapeTrackedBrandsAsync(host, ct);
+    return Results.Accepted(value: new { message = $"Iniciado el scraping por prefijo de marca para {host}. El proceso se ejecuta en segundo plano." });
+})
+.WithTags("Operations")
+.WithSummary("Usa los prefijos de EAN de la tabla 'ProductsToTrack' para encontrar y guardar todos los productos de esas marcas.");
 app.Run();
 
 static void MapRetailerAvailabilityProbe(WebApplication app) { /* ... tu código existente ... */ }

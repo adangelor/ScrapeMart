@@ -5,7 +5,7 @@
         public int Id { get; set; }
         public int ProductDbId { get; set; }
         public Product Product { get; set; } = default!;
-
+        public string RetailerHost { get; set; } = default!;
         public string ItemId { get; set; } = default!;
         public string? Name { get; set; }
         public string? NameComplete { get; set; }
