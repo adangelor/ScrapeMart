@@ -175,7 +175,10 @@ namespace ScrapeMart.Services
             if(!int.TryParse(prod["productId"]?.ToString() ?? "", out int pid))
                 return (0, 0);
 
-            var p = await _db.Products.Include(x => x.Skus).ThenInclude(s => s.Sellers).FirstOrDefaultAsync(x => x.RetailerHost == host && x.ProductId == pid, ct);
+             var p = await _db.Products
+                .Include(x => x.ProductCategories)
+                .Include(x => x.Skus).ThenInclude(s => s.Sellers).ThenInclude(se => se.Offers)
+                .FirstOrDefaultAsync(x => x.RetailerHost == host && x.ProductId == pid, ct);
 
             var isNew = false;
             if (p is null)
@@ -185,6 +188,7 @@ namespace ScrapeMart.Services
                 isNew = true;
             }
 
+            // --- Mapeo completo de propiedades del Producto ---
             p.ProductName = prod["productName"]?.ToString();
             p.Brand = prod["brand"]?.ToString();
             p.BrandId = TryInt(prod["brandId"]);
@@ -194,8 +198,26 @@ namespace ScrapeMart.Services
             p.ReleaseDateUtc = TryDate(prod["releaseDate"]);
             p.RawJson = prod.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
 
-            // ... (Lógica de categorías que ya funcionaba) ...
+            // --- Lógica de Categorías ---
+            var catIds = new HashSet<int>();
+            if (prod["categoriesIds"] is JsonArray cids)
+            {
+                foreach (var c in cids)
+                    if (int.TryParse(c?.ToString()?.Trim('/'), out var val)) catIds.Add(val);
+            }
 
+            var existingLinks = p.ProductCategories.ToList();
+            _db.ProductCategories.RemoveRange(existingLinks); // Limpiamos relaciones viejas
+            if (catIds.Count > 0)
+            {
+                var catMap = await _db.Categories.Where(x => x.RetailerHost == host && catIds.Contains(x.CategoryId)).ToListAsync(ct);
+                foreach (var c in catMap)
+                {
+                    _db.ProductCategories.Add(new ProductCategory { Product = p, Category = c });
+                }
+            }
+
+            // --- Lógica de SKUs y Sellers ---
             if (prod["items"] is JsonArray items)
             {
                 var byItemId = p.Skus.ToDictionary(s => s.ItemId, s => s);
@@ -211,6 +233,7 @@ namespace ScrapeMart.Services
                         _db.Skus.Add(sku);
                     }
 
+                    // --- Mapeo completo de propiedades del SKU ---
                     sku.Name = it["name"]?.ToString();
                     sku.NameComplete = it["nameComplete"]?.ToString();
                     sku.Ean = it["ean"]?.ToString();
@@ -232,6 +255,23 @@ namespace ScrapeMart.Services
                             }
                             seller.SellerName = sellerNode["sellerName"]?.ToString();
                             seller.SellerDefault = (bool?)sellerNode["sellerDefault"] ?? false;
+
+                            // --- Lógica COMPLETA para persistir la Oferta Comercial ---
+                            if (sellerNode["commertialOffer"] is JsonObject offerNode)
+                            {
+                                var offer = new CommercialOffer
+                                {
+                                    Seller = seller,
+                                    Price = TryDecimal(offerNode["Price"]) ?? 0,
+                                    ListPrice = TryDecimal(offerNode["ListPrice"]) ?? 0,
+                                    SpotPrice = TryDecimal(offerNode["spotPrice"]) ?? 0, // Aseguramos mapear spotPrice
+                                    PriceWithoutDiscount = TryDecimal(offerNode["PriceWithoutDiscount"]) ?? 0,
+                                    AvailableQuantity = TryInt(offerNode["AvailableQuantity"]) ?? 0,
+                                    PriceValidUntilUtc = TryDate(offerNode["PriceValidUntil"]),
+                                    CapturedAtUtc = DateTime.UtcNow
+                                };
+                                _db.Offers.Add(offer);
+                            }
                         }
                     }
                 }
@@ -240,6 +280,5 @@ namespace ScrapeMart.Services
             await _db.SaveChangesAsync(ct);
             return (1, isNew ? 1 : 0);
         }
-
     }
 }

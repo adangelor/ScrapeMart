@@ -35,7 +35,7 @@ builder.Services.AddHttpClient("vtexSession")
         return handler;
     })
     .AddPolicyHandler(HttpPolicyExtensions.HandleTransientHttpError().WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))));
-
+builder.Services.AddScoped<MasterOrchestratorService>();
 builder.Services.AddHttpClient(nameof(VtexPublicClient));
 builder.Services.AddScoped<BrandScrapingService>();
 builder.Services.AddScoped<VtexSweepService>();
@@ -55,17 +55,29 @@ builder.Services.AddSingleton<VtexPublicClient>(serviceProvider =>
 });
 
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c => { c.SwaggerDoc("v1", new OpenApiInfo { Title = "ScrapeMart API", Version = "v1" }); });
 
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "ScrapeMart API",
+        Version = "v1",
+        Description = "Scrapemart API"
+    });
+});
 var app = builder.Build();
 app.UseSwagger();
-app.UseSwaggerUI(c => { c.SwaggerEndpoint("/swagger/v1/swagger.json", "ScrapeMart API v1"); c.RoutePrefix = string.Empty; });
+app.UseSwaggerUI(c =>
+{
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "ScrapeMart API v1");
+    c.RoutePrefix = string.Empty;
+});
 
 // --- MAPEADO DE ENDPOINTS ---
 app.MapVtexCatalogSweepEndpoints();
 app.MapGroup("/api").WithOpenApi().WithTags("Catalog").MapCatalogEndpoints();
 app.MapRetailerAvailabilityEndpoints();
-MapRetailerAvailabilityProbe(app);
+
 
 app.MapPost("/ops/vtex/scrape-tracked-eans", async (
     string host,
@@ -119,8 +131,8 @@ app.MapPost("/ops/vtex/adeco-availability-probe", async (
 {
     try
     {
-        
-        await orchestrator.ProbeEanListAsync(host, 42,63, 3, ct);
+
+        await orchestrator.ProbeEanListAsync(host, 42, 63, 3, ct);
 
         return Results.Ok(new
         {
@@ -157,7 +169,8 @@ app.MapPost("/ops/vtex/full-catalog-sweep", async (
 .WithTags("Operations")
 .WithSummary("Orquesta el barrido completo: sincroniza categorías y luego barre todos los productos.");
 
-app.MapPost("/ops/vtex/fulltext-scan", async (ScanArgs args, [FromServices] VtexFulltextCrawler crawler, IHttpClientFactory httpFactory, CancellationToken ct) => {
+app.MapPost("/ops/vtex/fulltext-scan", async (ScanArgs args, [FromServices] VtexFulltextCrawler crawler, IHttpClientFactory httpFactory, CancellationToken ct) =>
+{
     var http = httpFactory.CreateClient("vtexSession");
     int totalRequests = 0, totalProductsParsed = 0, lastHttpStatus = 0;
     foreach (var h in args.Hosts)
@@ -171,7 +184,8 @@ app.MapPost("/ops/vtex/fulltext-scan", async (ScanArgs args, [FromServices] Vtex
     return Results.Ok(new { hosts = args.Hosts, totalRequests, totalProductsParsed, lastHttpStatus });
 }).WithTags("Operations");
 
-app.MapPost("/ops/vtex/sweep", async ([FromServices] VtexSweepService svc, string? host, string? sc, int? top, CancellationToken ct) => {
+app.MapPost("/ops/vtex/sweep", async ([FromServices] VtexSweepService svc, string? host, string? sc, int? top, CancellationToken ct) =>
+{
     int[] scList = string.IsNullOrWhiteSpace(sc) ? new[] { 1, 2 } : sc.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(int.Parse).ToArray();
     var count = await svc.SweepAsync(host, scList, top, ct);
     return Results.Ok(new { executed = count, scTried = scList, host });
@@ -186,9 +200,103 @@ app.MapPost("/ops/vtex/scrape-by-brand-prefix", async (
 })
 .WithTags("Operations")
 .WithSummary("Usa los prefijos de EAN de la tabla 'ProductsToTrack' para encontrar y guardar todos los productos de esas marcas.");
+
+app.MapPost("/ops/run-full-orchestration", async (
+    [FromServices] MasterOrchestratorService orchestrator,
+    [FromQuery] string? host = null) =>
+{
+    // El 'host' es opcional. Si no se pasa, corre para todos los retailers habilitados.
+    _ = orchestrator.RunFullProcessAsync(host);
+
+    var message = host == null
+        ? "Iniciado el proceso completo de orquestación para TODOS los retailers habilitados."
+        : $"Iniciado el proceso completo de orquestación para el retailer: {host}.";
+
+    return Results.Accepted(value: new { message = $"{message} El proceso se ejecuta en segundo plano." });
+})
+.WithTags("Operations")
+.WithSummary("EJECUTA EL PROCESO COMPLETO: Scrapea catálogo, mapea sucursales y sondea disponibilidad.")
+.WithDescription("Lee la VtexRetailersConfig y ejecuta la secuencia completa de 3 pasos para cada retailer habilitado (o para uno específico si se pasa como parámetro).");
+
+
+// Ruta: Program.cs
+
+// ===================================================================================
+// === ENDPOINTS DEL DASHBOARD (VERSIÓN CON STORED PROCEDURES) ===
+// ===================================================================================
+// ===================================================================================
+// === ENDPOINTS DEL DASHBOARD (USANDO STORED PROCEDURES) ===
+// ===================================================================================
+var dashboardGroup = app.MapGroup("/api/dashboard").WithTags("Dashboard").WithOpenApi();
+
+dashboardGroup.MapPost("/refresh-metrics", async (AppDb db) => {
+    await db.Database.ExecuteSqlRawAsync("EXEC [dbo].[sp_RefreshDashboardMetrics]");
+    return Results.Ok(new { message = "Las métricas del dashboard han sido actualizadas." });
+})
+.WithSummary("Calcula y guarda todas las métricas del dashboard. Ejecutar periódicamente.");
+
+dashboardGroup.MapGet("/report", async ([AsParameters] ReportFilters filters, AppDb db) =>
+{
+    var query = db.ProductAvailabilityReport.AsNoTracking();
+    if (!string.IsNullOrEmpty(filters.Provincia)) query = query.Where(r => r.Provincia == filters.Provincia);
+    if (!string.IsNullOrEmpty(filters.Empresa)) query = query.Where(r => r.Empresa == filters.Empresa);
+    if (!string.IsNullOrEmpty(filters.Ean)) query = query.Where(r => r.Ean == filters.Ean);
+    if (!string.IsNullOrEmpty(filters.Owner))
+    {
+        var eansByOwner = db.ProductsToTrack.Where(p => p.Owner == filters.Owner).Select(p => p.EAN);
+        query = query.Where(r => eansByOwner.Contains(r.Ean));
+    }
+    var totalItems = await query.CountAsync();
+    var data = await query.Skip((filters.Page - 1) * filters.PageSize).Take(filters.PageSize).ToListAsync();
+    return Results.Ok(new { TotalItems = totalItems, Page = filters.Page, PageSize = filters.PageSize, Data = data });
+})
+.WithSummary("Consulta la vista vw_ProductAvailabilityReport con filtros y paginación.");
+
+dashboardGroup.MapGet("/kpi/summary", async (AppDb db) =>
+{
+    var results = await db.Database.SqlQuery<KpiSummary>($"EXEC [dbo].[sp_GetKpiSummary] @OwnerBrand = {"Adeco"}").ToListAsync();
+    var summary = results.FirstOrDefault();
+    return Results.Ok(summary);
+})
+.WithSummary("KPIs principales: Disponibilidad Adeco vs. Competencia y penetración en tiendas.");
+
+dashboardGroup.MapGet("/kpi/by-province", async (AppDb db) =>
+{
+    var data = await db.Database.SqlQuery<AvailabilityByGroup>($"EXEC [dbo].[sp_GetAvailabilityByProvince]").ToListAsync();
+    return Results.Ok(data);
+})
+.WithSummary("Devuelve el % de disponibilidad de todos los productos, agrupado por provincia.");
+
+dashboardGroup.MapGet("/kpi/by-retailer", async (AppDb db) =>
+{
+    var data = await db.Database.SqlQuery<AvailabilityByGroup>($"EXEC [dbo].[sp_GetAvailabilityByRetailer]").ToListAsync();
+    return Results.Ok(data);
+})
+.WithSummary("Devuelve el % de disponibilidad de todos los productos, agrupado por cadena.");
+
+dashboardGroup.MapGet("/kpi/top-missing-products", async (AppDb db) =>
+{
+    var data = await db.Database.SqlQuery<MissingProductInfo>($"EXEC [dbo].[sp_GetTopMissingProducts] @OwnerBrand = {"Adeco"}").ToListAsync();
+    return Results.Ok(data);
+})
+.WithSummary("Ranking de los 20 productos propios con mayor % de faltante en góndola.");
+
+
 app.Run();
 
-static void MapRetailerAvailabilityProbe(WebApplication app) { /* ... tu código existente ... */ }
 public record ScanArgs(List<string> Hosts, string Query, int From = 0, int To = 49);
-public record ProbeRequest(string SellerId, string PickupPointId, string PostalCode, string CountryCode = "AR", int SalesChannel = 1);
-public static class RetailerDomainResolver { /* ... tu código existente ... */ }
+
+public class ReportFilters
+{
+    public string? Provincia { get; set; }
+    public string? Empresa { get; set; } // Corresponde a la columna Empresa
+    public string? Ean { get; set; }
+    public string? Owner { get; set; } // Para filtrar por 'Adeco' o 'Competencia'
+    public int Page { get; set; } = 1;
+    public int PageSize { get; set; } = 100;
+}
+
+// Clases para las respuestas de las métricas
+public record KpiSummary(decimal AdecoAvailability, decimal CompetitorAvailability, int TotalStoresWithAdecoPresence, int TotalStoresScanned);
+public record AvailabilityByGroup(string Group, decimal AvailabilityPercentage);
+public record MissingProductInfo(string Ean, string Producto, string Marca, int StoresWithMissingStock, decimal MissingPercentage);

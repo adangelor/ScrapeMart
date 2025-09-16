@@ -19,7 +19,8 @@ namespace ScrapeMart.Storage
         public DbSet<VtexPickupPoint> VtexPickupPoints => Set<VtexPickupPoint>();
 
         public DbSet<ProductToTrack> ProductsToTrack { get; internal set; }
-
+        public DbSet<ProductAvailabilityReport> ProductAvailabilityReport => Set<ProductAvailabilityReport>();
+        public DbSet<SweepLog> SweepLogs => Set<SweepLog>();
         protected override void OnModelCreating(ModelBuilder b)
         {
             b.Entity<ProductToTrack>().HasKey(p => p.EAN); // <-- AÑADIR ESTA LÍNEA AL PRINCIPIO
@@ -32,7 +33,10 @@ namespace ScrapeMart.Storage
                 e.HasIndex(x => new { x.RetailerHost, x.ProductId }).IsUnique(); 
                 e.Property(x => x.RawJson).HasColumnType("nvarchar(max)");
             });
-
+            b.Entity<ProductAvailabilityReport>(e => {
+                e.HasNoKey(); 
+                e.ToView("vw_ProductAvailabilityReport");
+            });
             b.Entity<Sku>(e =>
             {
                 e.HasIndex(x => new { x.RetailerHost, x.ItemId }).IsUnique();
@@ -75,14 +79,11 @@ namespace ScrapeMart.Storage
                 e.HasOne(x => x.Product).WithMany(x => x.Properties).HasForeignKey(x => x.ProductDbId);
             });
 
-            // --- ¡CONFIGURACIÓN CORREGIDA PARA CATEGORIES! ---
-            b.Entity<Category>(e =>
+             b.Entity<Category>(e =>
             {
-                // La combinación de Host y CategoryId es única. No puede haber dos "Lácteos" con el ID 121 para DIA.
-                e.HasIndex(x => new { x.RetailerHost, x.CategoryId }).IsUnique();
+                 e.HasIndex(x => new { x.RetailerHost, x.CategoryId }).IsUnique();
                 e.HasOne(x => x.Parent).WithMany(x => x.Children).HasForeignKey(x => x.ParentDbId);
             });
-            // --- FIN DE LA CORRECCIÓN ---
 
             b.Entity<Sku>(e =>
             {

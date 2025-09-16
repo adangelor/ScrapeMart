@@ -61,6 +61,6 @@ public sealed record SweepSummary(string Host)
 {
     public int CategoriesSynced { get; set; }
     public int TotalProductsFound { get; set; }
-    // (Otras propiedades de resumen se pueden quitar si ya no aplican)
+   
     public string? ErrorMessage { get; set; }
 }

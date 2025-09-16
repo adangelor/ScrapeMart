@@ -449,15 +449,16 @@ public sealed class VtexPublicClient
         return SimulatePickupAsync(GetClient(), _host, salesChannel, skuId, quantity, sellerId, countryCode, postalCode, geo, pickupPointId, ct);
     }
 
+    // Ruta: ScrapeMart/Services/VtexPublicClient.cs
     public async Task<MultiSimResult> SimulateMultiSkuPickupAsync(
-    HttpClient http,
-    string host,
-    int salesChannel,
-    IEnumerable<SkuIdentifier> skus,
-    string countryCode,
-    string? postalCode,
-    string pickupPointId,
-    CancellationToken ct = default)
+        HttpClient http,
+        string host,
+        int salesChannel,
+        IEnumerable<SkuIdentifier> skus,
+        string countryCode,
+        string? postalCode,
+        string pickupPointId,
+        CancellationToken ct = default)
     {
         var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
         var cc = NormalizeCountry(countryCode);
@@ -466,7 +467,7 @@ public sealed class VtexPublicClient
             id = sku.Id,
             quantity = sku.Quantity,
             seller = sku.Seller,
-            itemIndex = index // Necesario para el mapeo
+            itemIndex = index
         }).ToList();
 
         var logisticsInfoPayload = itemsPayload.Select(item => new {
@@ -507,8 +508,21 @@ public sealed class VtexPublicClient
                 if (skuId is null) continue;
 
                 var availability = itemEl.TryGetProperty("availability", out var availProp) && availProp.GetString() == "available";
-                var price = itemEl.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spd) ? spd / 100m : (decimal?)null;
-                var listPrice = itemEl.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpd) ? lpd / 100m : (decimal?)null;
+
+                // --- ¡LA CORRECCIÓN ESTÁ AQUÍ! ---
+                // Primero verificamos que el campo exista y que NO sea null antes de intentar leerlo como número.
+                decimal? price = null;
+                if (itemEl.TryGetProperty("sellingPrice", out var sp) && sp.ValueKind == JsonValueKind.Number)
+                {
+                    price = sp.GetDecimal() / 100m;
+                }
+
+                decimal? listPrice = null;
+                if (itemEl.TryGetProperty("listPrice", out var lp) && lp.ValueKind == JsonValueKind.Number)
+                {
+                    listPrice = lp.GetDecimal() / 100m;
+                }
+                // --- FIN DE LA CORRECCIÓN ---
 
                 results[skuId] = new SimResultItem(availability, price, listPrice);
             }

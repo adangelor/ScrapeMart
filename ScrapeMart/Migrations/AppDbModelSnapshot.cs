@@ -56,7 +56,7 @@ namespace ScrapeMart.Migrations
                     b.HasIndex("RetailerHost", "CategoryId")
                         .IsUnique();
 
-                    b.ToTable("Categories");
+                    b.ToTable("Categories", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.CommercialOffer", b =>
@@ -95,7 +95,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasIndex("SellerDbId");
 
-                    b.ToTable("Offers");
+                    b.ToTable("Offers", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Image", b =>
@@ -125,7 +125,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasIndex("SkuDbId");
 
-                    b.ToTable("Images");
+                    b.ToTable("Images", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Product", b =>
@@ -175,7 +175,7 @@ namespace ScrapeMart.Migrations
                     b.HasIndex("RetailerHost", "ProductId")
                         .IsUnique();
 
-                    b.ToTable("Products");
+                    b.ToTable("Products", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.ProductCategory", b =>
@@ -190,7 +190,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasIndex("CategoryDbId");
 
-                    b.ToTable("ProductCategories");
+                    b.ToTable("ProductCategories", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.ProductProperty", b =>
@@ -216,7 +216,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasIndex("ProductDbId", "Name");
 
-                    b.ToTable("Properties");
+                    b.ToTable("Properties", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Seller", b =>
@@ -245,7 +245,7 @@ namespace ScrapeMart.Migrations
                     b.HasIndex("SkuDbId", "SellerId")
                         .IsUnique();
 
-                    b.ToTable("Sellers");
+                    b.ToTable("Sellers", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Sku", b =>
@@ -287,7 +287,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasIndex("ProductDbId");
 
-                    b.ToTable("Skus");
+                    b.ToTable("Skus", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Sucursal", b =>
@@ -317,7 +317,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasKey("IdBandera", "IdComercio", "IdSucursal");
 
-                    b.ToTable("Sucursales");
+                    b.ToTable("Sucursales", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.VtexPickupPoint", b =>
@@ -339,7 +339,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasKey("RetailerHost", "PickupPointId");
 
-                    b.ToTable("VtexPickupPoints");
+                    b.ToTable("VtexPickupPoints", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.VtexRetailersConfig", b =>
@@ -367,7 +367,7 @@ namespace ScrapeMart.Migrations
 
                     b.HasKey("Id");
 
-                    b.ToTable("VtexRetailersConfig");
+                    b.ToTable("VtexRetailersConfig", (string)null);
                 });
 
             modelBuilder.Entity("ScrapeMart.Entities.Category", b =>

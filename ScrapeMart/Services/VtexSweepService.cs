@@ -1,4 +1,7 @@
 ﻿using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using ScrapeMart.Entities;
+using ScrapeMart.Storage;
 using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Text;
@@ -11,6 +14,7 @@ public sealed class VtexSweepService
     private readonly IHttpClientFactory _http;
     private readonly ILogger<VtexSweepService> _log;
     private readonly string _sqlConn;
+    private readonly AppDb _db;
 
     // Cache por host del SKU y seller de prueba para no pegar mil veces al search
     private readonly ConcurrentDictionary<string, (string SkuId, string SellerId)> _probeCache = new();
@@ -20,8 +24,11 @@ public sealed class VtexSweepService
         PropertyNameCaseInsensitive = true
     };
 
-    public VtexSweepService(IHttpClientFactory http, ILogger<VtexSweepService> log, IConfiguration cfg)
+    public VtexSweepService(IHttpClientFactory http,
+        ILogger<VtexSweepService> log, IConfiguration cfg,
+        AppDb appDb)
     {
+        _db = appDb;
         _http = http;
         _log = log;
         _sqlConn = cfg.GetConnectionString("Default")!;
@@ -29,71 +36,107 @@ public sealed class VtexSweepService
 
     public async Task<int> SweepAsync(string? hostFilter = null, int[]? scCandidates = null, int? top = null, CancellationToken ct = default)
     {
-        var rows = await LoadWorkAsync(hostFilter, top, ct);
-
-        var http = _http.CreateClient("vtexSession");
-        http.Timeout = TimeSpan.FromSeconds(90);
-
-        // --- LA CORRECCIÓN REAL ---
-        // Usamos el User-Agent de un navegador para no ser bloqueados.
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
-        // --- FIN DE LA CORRECCIÓN ---
-
-        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
-
-        var totalOps = 0;
-
-        foreach (var r in rows)
+        if (!string.IsNullOrEmpty(hostFilter))
         {
-            int[] channelsToSweep = r.SalesChannels
-                                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                                     .Select(s => int.TryParse(s, out var i) ? i : -1)
-                                     .Where(i => i != -1)
-                                     .ToArray();
+            var lastSuccessfulSweep = await _db.SweepLogs
+                .Where(log => log.RetailerHost == hostFilter && log.SweepType == "PickupPoints" && log.Status == "Success")
+                .OrderByDescending(log => log.CompletedAtUtc)
+                .FirstOrDefaultAsync(ct);
 
-            if (channelsToSweep.Length == 0)
+            if (lastSuccessfulSweep != null && (DateTime.UtcNow - lastSuccessfulSweep.CompletedAtUtc.Value).TotalDays < 7)
             {
-                channelsToSweep = scCandidates ?? new[] { 1 };
-            }
-
-            foreach (var sc in channelsToSweep)
-            {
-                var pickupsFound = 0;
-                var sellersFound = 0;
-
-                if (r.Long.HasValue && r.Lat.HasValue)
-                {
-                    var geo = $"{r.Long.Value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)};{r.Lat.Value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)}";
-                    var urlGeo = $"{r.Host}/api/checkout/pub/pickup-points?geoCoordinates={geo}&sc={sc}";
-                    pickupsFound += await DiscoverPickupAsync(http, r, sc, "geo", r.Long, r.Lat, null, urlGeo, ct);
-                }
-
-                if (!string.IsNullOrWhiteSpace(r.Postal))
-                {
-                    var urlPostal = $"{r.Host}/api/checkout/pub/pickup-points?postalCode={Uri.EscapeDataString(r.Postal!)}&countryCode=AR&sc={sc}";
-                    pickupsFound += await DiscoverPickupAsync(http, r, sc, "postal", null, null, r.Postal, urlPostal, ct);
-                }
-
-                if (!string.IsNullOrWhiteSpace(r.Postal))
-                {
-                    var urlRegions = $"{r.Host}/api/checkout/pub/regions?country=AR&postalCode={Uri.EscapeDataString(r.Postal!)}&sc={sc}";
-                    sellersFound += await DiscoverRegionsAsync(http, r, sc, r.Postal!, urlRegions, ct);
-                }
-
-                if (pickupsFound == 0 && sellersFound == 0)
-                {
-                    _log.LogInformation("No se encontraron pickups ni sellers para la sucursal {IdSucursal} de {Host}. Activando fallback por simulación...", r.IdSucursal, r.Host);
-                    var probe = await GetProbeSkuAsync(http, r.Host, sc, ct);
-                    if (probe is not null)
-                    {
-                        await DiscoverStoresViaSimulationAsync(http, r, sc, r.Postal, null, probe.Value.SkuId, probe.Value.SellerId, ct);
-                    }
-                }
-
-                totalOps++;
+                _log.LogInformation("SALTANDO SWEEP para {Host}. El último barrido exitoso fue hace menos de 7 días (el {Date}).",
+                    hostFilter, lastSuccessfulSweep.CompletedAtUtc.Value.ToLocalTime());
+                return 0; // No se ejecuta ninguna operación
             }
         }
+        var rows = await LoadWorkAsync(hostFilter, top, ct);
+        var logEntry = new SweepLog
+        {
+            RetailerHost = hostFilter ?? "ALL",
+            SweepType = "PickupPoints",
+            StartedAtUtc = DateTime.UtcNow,
+            Status = "Running"
+        };
+        var totalOps = 0;
+        try
+        {
+            _db.SweepLogs.Add(logEntry);
+            await _db.SaveChangesAsync(ct);
+            var http = _http.CreateClient("vtexSession");
+            http.Timeout = TimeSpan.FromSeconds(90);
 
+            http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
+
+
+            http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+
+
+
+            foreach (var r in rows)
+            {
+                int[] channelsToSweep = [.. r.SalesChannels
+                                     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                                     .Select(s => int.TryParse(s, out var i) ? i : -1)
+                                     .Where(i => i != -1)];
+
+                if (channelsToSweep.Length == 0)
+                {
+                    channelsToSweep = scCandidates ?? new[] { 1 };
+                }
+
+                foreach (var sc in channelsToSweep)
+                {
+                    var pickupsFound = 0;
+                    var sellersFound = 0;
+
+                    if (r.Long.HasValue && r.Lat.HasValue)
+                    {
+                        var geo = $"{r.Long.Value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)};{r.Lat.Value.ToString("0.######", System.Globalization.CultureInfo.InvariantCulture)}";
+                        var urlGeo = $"{r.Host}/api/checkout/pub/pickup-points?geoCoordinates={geo}&sc={sc}";
+                        var found = await DiscoverPickupAsync(http, r, sc, "geo", r.Long, r.Lat, null, urlGeo, ct);
+                        pickupsFound += found;
+                   
+                        if (!string.IsNullOrWhiteSpace(r.Postal))
+                        {
+                            var urlPostal = $"{r.Host}/api/checkout/pub/pickup-points?postalCode={Uri.EscapeDataString(r.Postal!)}&countryCode=AR&sc={sc}";
+                            pickupsFound += await DiscoverPickupAsync(http, r, sc, "postal", null, null, r.Postal, urlPostal, ct);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(r.Postal))
+                        {
+                            var urlRegions = $"{r.Host}/api/checkout/pub/regions?country=AR&postalCode={Uri.EscapeDataString(r.Postal!)}&sc={sc}";
+                            sellersFound += await DiscoverRegionsAsync(http, r, sc, r.Postal!, urlRegions, ct);
+                        }
+                    }
+                    if (pickupsFound == 0 && sellersFound == 0)
+                    {
+                        _log.LogInformation("No se encontraron pickups ni sellers para la sucursal {IdSucursal} de {Host}. Activando fallback por simulación...", r.IdSucursal, r.Host);
+                        var probe = await GetProbeSkuAsync(http, r.Host, sc, ct);
+                        if (probe is not null)
+                        {
+                            await DiscoverStoresViaSimulationAsync(http, r, sc, r.Postal, null, probe.Value.SkuId, probe.Value.SellerId, ct);
+                        }
+                    }
+
+                    totalOps++;
+                }
+            }
+            logEntry.Status = "Success";
+            logEntry.Notes = $"Se procesaron {totalOps} operaciones.";
+        }
+        catch (Exception ex)
+        {
+            logEntry.Status = "Failed";
+            logEntry.Notes = ex.Message;
+            _log.LogError(ex, "El barrido falló inesperadamente.");
+            throw;
+        }
+        finally
+        {
+            logEntry.CompletedAtUtc = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct); // Guardamos el estado final del log (Success, Failed)
+        }
         return totalOps;
     }
 
@@ -417,23 +460,24 @@ VALUES
         var list = new List<WorkRow>();
         var sql = new StringBuilder(@"
 SELECT " + (top.HasValue ? $"TOP ({top.Value})" : "TOP (10000)") + @"
-    b.IdBandera, b.IdComercio,
+    cfg.IdBandera, cfg.IdComercio,
     cfg.RetailerHost AS Host,
     cfg.SalesChannels AS SalesChannels,
     s.IdSucursal,
     NULLIF(LTRIM(RTRIM(s.SucursalesCodigoPostal)), '') AS Postal,
     CASE WHEN s.SucursalesLongitud = 0 THEN NULL ELSE s.SucursalesLongitud END AS Lon,
     CASE WHEN s.SucursalesLatitud  = 0 THEN NULL ELSE s.SucursalesLatitud  END AS Lat
-FROM dbo.Banderas b
-JOIN dbo.VtexRetailersConfig cfg ON cfg.IdBandera=b.IdBandera AND cfg.IdComercio=b.IdComercio AND cfg.Enabled=1
-JOIN dbo.Sucursales s ON s.IdBandera=b.IdBandera AND s.IdComercio=b.IdComercio
+FROM dbo.VtexRetailersConfig cfg
+JOIN dbo.Sucursales s ON s.IdBandera = cfg.IdBandera AND s.IdComercio = cfg.IdComercio
+WHERE cfg.Enabled=1
 ");
 
         if (!string.IsNullOrWhiteSpace(hostFilter))
-            sql.Append("WHERE cfg.RetailerHost = @host ");
+        {
+            sql.Append("AND cfg.RetailerHost = @host ");
+        }
 
-        sql.Append("ORDER BY b.IdBandera, b.IdComercio, s.IdSucursal;");
-
+        sql.Append("ORDER BY cfg.IdBandera, cfg.IdComercio, s.IdSucursal;");
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql.ToString(), cn);
