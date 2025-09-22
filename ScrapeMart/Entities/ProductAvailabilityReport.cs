@@ -23,6 +23,13 @@ public class ProductAvailabilityReport
     public string? Subcategoria { get; set; }
     public string? Categoria3 { get; set; }
     public string? Producto { get; set; }
+    //PRECIOS
+    public decimal? PrecioVenta { get; set; }
+    public decimal? PrecioLista { get; set; }
+    public decimal? PrecioPromocion { get; set; }
+    public decimal? PorcentajeDescuento { get; set; }
+    public decimal? AhorroEnPesos { get; set; }
+    public string? Moneda { get; set; }
 
     // Info de Disponibilidad
     public int? Stock { get; set; }
