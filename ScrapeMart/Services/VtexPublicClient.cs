@@ -463,14 +463,16 @@ public sealed class VtexPublicClient
         var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
         var cc = NormalizeCountry(countryCode);
 
-        var itemsPayload = skus.Select((sku, index) => new {
+        var itemsPayload = skus.Select((sku, index) => new
+        {
             id = sku.Id,
             quantity = sku.Quantity,
             seller = sku.Seller,
             itemIndex = index
         }).ToList();
 
-        var logisticsInfoPayload = itemsPayload.Select(item => new {
+        var logisticsInfoPayload = itemsPayload.Select(item => new
+        {
             itemIndex = item.itemIndex,
             selectedSla = pickupPointId,
             selectedDeliveryChannel = "pickup-in-point"
@@ -530,4 +532,139 @@ public sealed class VtexPublicClient
 
         return new MultiSimResult(raw, results);
     }
+
+    /// <summary>
+    /// Método interno helper que es llamado por el OptimizedAvailabilityService
+    /// </summary>
+    internal async Task<MultiSimResult> SimulateMultiSkuPickupAsync(
+        HttpClient httpClient,
+        string host,
+        int salesChannel,
+        IEnumerable<SkuIdentifier> skuIdentifiers,
+        string countryCode,
+        string postalCode,
+        string pickupPointId,
+        string city,
+        string province,
+        CancellationToken ct)
+    {
+        // Simplemente llama al método público con todos los parámetros
+        return await SimulateMultiSkuPickupAsync(
+            httpClient,
+            host,
+            salesChannel,
+            skuIdentifiers,
+            countryCode,
+            postalCode,
+            pickupPointId,
+            city,
+            province,
+            ct);
+    }
+
+    // AGREGAR ESTE MÉTODO A TU VtexPublicClient.cs
+
+    /// <summary>
+    /// Sobrecarga que acepta city y province - ESTA ES LA QUE TE FALTABA
+    /// </summary>
+    public async Task<SimResult> SimulatePickupAsync(
+        HttpClient http,
+        string host,
+        int salesChannel,
+        string skuId,
+        int quantity,
+        string sellerId,
+        string countryCode,
+        string postalCode,
+        string pickupPointId,
+        string? city,        // ¡PARÁMETRO NUEVO!
+        string? province,    // ¡PARÁMETRO NUEVO!
+        CancellationToken ct = default)
+    {
+        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
+        var cc = NormalizeCountry(countryCode);
+
+        var body = new
+        {
+            items = new[] { new { id = skuId, quantity = quantity, seller = sellerId } },
+            postalCode = postalCode,
+            country = cc,
+            shippingData = new
+            {
+                address = new
+                {
+                    addressType = "pickup",
+                    country = cc,
+                    postalCode = postalCode,
+                    city = city ?? "CABA",           // Usa datos reales o fallback
+                    state = province ?? "CABA",      // Usa datos reales o fallback
+                    street = "",
+                    number = "",
+                    complement = "",
+                    receiverName = "",
+                    neighborhood = ""
+                },
+                logisticsInfo = new[]
+                {
+                new
+                {
+                    itemIndex = 0,
+                    selectedSla = pickupPointId,
+                    selectedDeliveryChannel = "pickup-in-point"
+                }
+            }
+            }
+        };
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(body, _json), Encoding.UTF8, "application/json")
+        };
+
+        using var resp = await http.SendAsync(req, ct);
+        var raw = await resp.Content.ReadAsStringAsync(ct);
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            throw new VtexHttpException("Pickup simulation failed", resp.StatusCode, raw, new { skuId, pickupPointId, city, province });
+        }
+
+        using var doc = JsonDocument.Parse(raw);
+        bool available = false;
+
+        if (doc.RootElement.TryGetProperty("logisticsInfo", out var li) && li.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var logisticsItem in li.EnumerateArray())
+            {
+                if (logisticsItem.TryGetProperty("slas", out var slas) && slas.ValueKind == JsonValueKind.Array)
+                {
+                    if (slas.EnumerateArray().Any(sla =>
+                        sla.TryGetProperty("id", out var slaId) && slaId.GetString() == pickupPointId &&
+                        sla.TryGetProperty("deliveryChannel", out var dc) && dc.GetString() == "pickup-in-point"))
+                    {
+                        available = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        decimal? price = null;
+        decimal? listPrice = null;
+        if (doc.RootElement.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array && items.GetArrayLength() > 0)
+        {
+            var item = items[0];
+            if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spDecimal)) price = spDecimal / 100m;
+            if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpDecimal)) listPrice = lpDecimal / 100m;
+        }
+
+        string currency = "ARS";
+        if (doc.RootElement.TryGetProperty("storePreferencesData", out var prefs) && prefs.TryGetProperty("currencyCode", out var cc2))
+        {
+            currency = cc2.GetString() ?? currency;
+        }
+
+        return new SimResult(available, price, listPrice, currency, raw);
+    }
+
 }

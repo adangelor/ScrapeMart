@@ -1,5 +1,4 @@
-﻿// File: Services/VtexAvailabilityService.cs
-namespace ScrapeMart.Services;
+﻿namespace ScrapeMart.Services;
 
 public static class VtexAvailabilityService
 {

@@ -21,6 +21,9 @@ namespace ScrapeMart.Storage
         public DbSet<ProductToTrack> ProductsToTrack { get; internal set; }
         public DbSet<ProductAvailabilityReport> ProductAvailabilityReport => Set<ProductAvailabilityReport>();
         public DbSet<SweepLog> SweepLogs => Set<SweepLog>();
+
+        public DbSet<Store> Stores => Set<Store>();
+        public DbSet<Retailer> Retailers => Set<Retailer>();
         protected override void OnModelCreating(ModelBuilder b)
         {
             b.Entity<ProductToTrack>().HasKey(p => p.EAN); // <-- AÑADIR ESTA LÍNEA AL PRINCIPIO

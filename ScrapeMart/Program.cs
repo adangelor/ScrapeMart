@@ -57,10 +57,18 @@ builder.Services.AddScoped<CatalogOrchestratorService>();
 builder.Services.AddScoped<MasterOrchestratorService>();
 builder.Services.AddScoped<VtexToProductsTranscriberService>();
 builder.Services.AddScoped<IRetailerConfigService, RetailerConfigService>();
-
-// Query Services
+builder.Services.AddScoped<ComprehensiveAvailabilityService>();
+builder.Services.AddScoped<OptimizedAvailabilityService>();
+builder.Services.AddScoped<BasicDebuggingService>();
 builder.Services.AddCatalogQueryService();
-
+builder.Services.AddScoped<VtexEndpointTesterService>();
+builder.Services.AddScoped<WorkingVtexFlowService>();
+builder.Services.AddScoped<VtexOrderFormService>();
+builder.Services.AddScoped<VtexSessionService>();
+builder.Services.AddScoped<VtexApiTester>();
+builder.Services.AddScoped<VtexProxyService>();
+builder.Services.AddScoped<VtexSimpleSessionService>();
+builder.Services.AddScoped<VtexSimulationService>();
 var app = builder.Build();
 
 // ===== CONFIGURACIÓN DEL PIPELINE =====
@@ -70,7 +78,6 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
-
 app.UseHttpsRedirection();
 app.UseAuthorization();
 app.MapControllers();
@@ -95,5 +102,7 @@ var opsGroup = app.MapGroup("/api/ops")
     .WithOpenApi();
 opsGroup.MapOperationsEndpoints();
 opsGroup.MapDashboardEndpoints();
+opsGroup.MapOrderFormEndpoints();
+
 
 app.Run();

@@ -95,9 +95,20 @@ public static class OperationsEndpoints
             })
             .WithName("TranscribeVtexProducts")
             .WithSummary("Transcribe productos desde tablas VTEX raw a tablas definitivas");
-
+        // En tu OperationsEndpoints.cs
+        group.MapPost("/availability/comprehensive-check",
+            async ([FromServices] ComprehensiveAvailabilityService service,
+                   string? specificRetailerHost,
+                   CancellationToken ct) =>
+            {
+                var result = await service.RunComprehensiveAvailabilityCheckAsync(specificRetailerHost, ct);
+                return Results.Ok(result);
+            })
+            .WithName("RunComprehensiveAvailabilityCheck")
+            .WithSummary("Verifica disponibilidad de productos trackeados en TODAS las sucursales de TODAS las cadenas VTEX");
         return group;
     }
+
 
 }
 
@@ -181,10 +192,77 @@ public static class DashboardEndpoints
         })
         .WithName("GetTopMissingProducts")
         .WithSummary("Ranking de los 20 productos propios con mayor % de faltante en góndola.");
+        // agregar de optimizedavailabilityservice, los endpoints, ¿no?
+        group.MapGet("/availability/optimized-check",
+            async ([FromServices] OptimizedAvailabilityService service,
+                   string? specificRetailerHost,
+                   CancellationToken ct) =>
+            {
+                await service.ProbeAllEansInAllStoresAsync(specificRetailerHost,29, 50, 8,ct);
+                return Results.Ok("Proceso terminado.");
+            })
+            .WithName("RunOptimizedAvailabilityCheck")
+            .WithSummary("Verifica disponibilidad de productos trackeados en TODAS las sucursales de TODAS las cadenas VTEX, optimizado para grandes volúmenes.");
+        group.MapPost("/debug/basic-connectivity",
+    async ([FromServices] BasicDebuggingService service,
+           string host,
+           CancellationToken ct) =>
+    {
+        var result = await service.DiagnoseBasicConnectivityAsync(host, ct);
+        return Results.Ok(result);
+    })
+    .WithName("DebugBasicConnectivity")
+    .WithSummary("🚨 Diagnosis básica de conectividad");
+
+        group.MapPost("/debug/test-configurations",
+            async ([FromServices] BasicDebuggingService service,
+                   string host,
+                   CancellationToken ct) =>
+            {
+                var results = await service.TestDifferentConfigurationsAsync(host, ct);
+                return Results.Ok(results);
+            })
+            .WithName("DebugTestConfigurations")
+            .WithSummary("🧪 Test diferentes configuraciones de headers");
+        group.MapPost("/debug/test-vtex-endpoints",
+    async ([FromServices] VtexEndpointTesterService service,
+           string host,
+           CancellationToken ct) =>
+    {
+        var results = await service.TestVtexEndpointsAsync(host, ct);
+        return Results.Ok(results);
+    })
+    .WithName("TestVtexEndpoints")
+    .WithSummary("🧪 Test sistemático de endpoints VTEX");
+
+        group.MapPost("/debug/find-working-product",
+            async ([FromServices] VtexEndpointTesterService service,
+                   string host,
+                   CancellationToken ct) =>
+            {
+                var result = await service.FindWorkingProductAsync(host, ct);
+                return Results.Ok(result);
+            })
+            .WithName("FindWorkingProduct")
+            .WithSummary("🔍 Encontrar un producto que funcione para testing");
+
+        group.MapPost("/test/working-flow",
+            async ([FromServices] WorkingVtexFlowService service,
+                   string host,
+                   CancellationToken ct) =>
+            {
+                var result = await service.RunWorkingFlowAsync(host, ct);
+                return Results.Ok(result);
+            })
+            .WithName("TestWorkingFlow")
+            .WithSummary("Flujo que SÍ funciona - evita pickup points problemáticos");
+
 
         return group;
     }
 }
+
+
 
 // ===================================================================================
 // === DTOs PARA EL DASHBOARD ===

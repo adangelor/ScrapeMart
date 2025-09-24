@@ -1,5 +1,4 @@
-﻿// File: Services/VtexAvailabilityProbeService.cs
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 
 namespace ScrapeMart.Services;
 
@@ -22,6 +21,7 @@ public sealed class VtexAvailabilityProbeService
         _sqlConn = cfg.GetConnectionString("Default")!;
     }
 
+    // ¡MÉTODO ACTUALIZADO CON PARÁMETROS DE CIUDAD Y PROVINCIA!
     public async Task<ProbeResult> ProbePickupAsync(
         string host,
         int salesChannel,
@@ -30,20 +30,23 @@ public sealed class VtexAvailabilityProbeService
         string pickupPointId,
         string countryCode,
         string postalCode,
+        string? city = null,        // ¡NUEVO PARÁMETRO!
+        string? province = null,    // ¡NUEVO PARÁMETRO!
         int maxCap = 512,
         CancellationToken ct = default)
     {
         var http = _http.CreateClient("vtexSession");
-        // Paso 0: chequeo con qty=1
-        var sim1 = await _vtex.SimulatePickupAsync(http, host, salesChannel, skuId, 1, sellerId, countryCode, postalCode, pickupPointId, ct);
 
-        // --- CORRECCIÓN AQUÍ ---
+        // Paso 0: chequeo con qty=1
+        var sim1 = await _vtex.SimulatePickupAsync(
+            http, host, salesChannel, skuId, 1, sellerId,
+            countryCode, postalCode, pickupPointId,
+            city, province, ct); // ¡NUEVOS PARÁMETROS PASADOS!
+
         if (!sim1.Available)
         {
-            // --- Y CORRECCIÓN AQUÍ ---
             await UpsertAsync(host, pickupPointId, skuId, sellerId, salesChannel, countryCode, postalCode,
                               false, 0, sim1.Price, sim1.Currency, sim1.Raw, ct);
-            // --- Y CORRECCIÓN AQUÍ ---
             return new ProbeResult(false, 0, sim1.Price, sim1.Currency);
         }
 
@@ -51,8 +54,11 @@ public sealed class VtexAvailabilityProbeService
         int lo = 1, hi = 2;
         while (hi <= maxCap)
         {
-            var sim = await _vtex.SimulatePickupAsync(http, host, salesChannel, skuId, hi, sellerId, countryCode, postalCode, pickupPointId, ct);
-            // --- CORRECCIÓN AQUÍ ---
+            var sim = await _vtex.SimulatePickupAsync(
+                http, host, salesChannel, skuId, hi, sellerId,
+                countryCode, postalCode, pickupPointId,
+                city, province, ct); // ¡NUEVOS PARÁMETROS PASADOS!
+
             if (sim.Available)
             {
                 lo = hi;
@@ -71,8 +77,11 @@ public sealed class VtexAvailabilityProbeService
         while (left <= right)
         {
             int mid = (left + right) / 2;
-            var sim = await _vtex.SimulatePickupAsync(http, host, salesChannel, skuId, mid, sellerId, countryCode, postalCode, pickupPointId, ct);
-            // --- CORRECCIÓN AQUÍ ---
+            var sim = await _vtex.SimulatePickupAsync(
+                http, host, salesChannel, skuId, mid, sellerId,
+                countryCode, postalCode, pickupPointId,
+                city, province, ct); // ¡NUEVOS PARÁMETROS PASADOS!
+
             if (sim.Available)
             {
                 best = mid;
@@ -85,11 +94,9 @@ public sealed class VtexAvailabilityProbeService
         }
 
         // Guardar con el precio de sim1
-        // --- CORRECCIÓN AQUÍ ---
         await UpsertAsync(host, pickupPointId, skuId, sellerId, salesChannel, countryCode, postalCode,
                           true, best, sim1.Price, sim1.Currency, sim1.Raw, ct);
 
-        // --- Y CORRECCIÓN AQUÍ ---
         return new ProbeResult(true, best, sim1.Price, sim1.Currency);
     }
 
