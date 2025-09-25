@@ -1,42 +1,46 @@
-﻿// File: Services/VtexOrderFormService.cs
+﻿// File: Services/VtexOrderFormService.cs - CORREGIDO para usar VtexCookieManager
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
 using System.Text;
 using System.Text.Json;
+using System.Net;
 
 namespace ScrapeMart.Services;
 
 /// <summary>
-/// Servicio que usa el flujo real de orderForm de VTEX como lo hace la web
+/// CORREGIDO: USA VtexCookieManager para flujo orderForm de todas las cadenas VTEX
 /// </summary>
 public sealed class VtexOrderFormService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<VtexOrderFormService> _log;
     private readonly string _sqlConn;
+    private readonly IVtexCookieManager _cookieManager; // 🍪 AGREGADO
 
-    public VtexOrderFormService(IServiceProvider serviceProvider, ILogger<VtexOrderFormService> log, IConfiguration cfg)
+    public VtexOrderFormService(
+        IServiceProvider serviceProvider,
+        ILogger<VtexOrderFormService> log,
+        IConfiguration cfg,
+        IVtexCookieManager cookieManager) // 🍪 INYECTADO
     {
         _serviceProvider = serviceProvider;
         _log = log;
         _sqlConn = cfg.GetConnectionString("Default")!;
+        _cookieManager = cookieManager; // 🍪 ASIGNADO
     }
 
     /// <summary>
-    /// Flujo completo: Crear orderForm → Agregar items → Simular shipping → Verificar disponibilidad
+    /// 🛒 MÉTODO CORREGIDO: Flujo completo orderForm usando VtexCookieManager
     /// </summary>
     public async Task ProbeAvailabilityWithOrderFormAsync(string host, CancellationToken ct)
     {
-        _log.LogInformation("🛒 Iniciando flujo REAL de OrderForm para {Host}", host);
+        _log.LogInformation("🛒 Iniciando flujo OrderForm con VtexCookieManager para {Host}", host);
 
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
 
-        // 🆕 Usar el proxy service en lugar del session service problemático
-        var proxyService = scope.ServiceProvider.GetRequiredService<VtexProxyService>();
-
-        // 1. Obtener configuración y datos base
+        // 🔧 OBTENER CONFIG DE LA CADENA
         var config = await db.VtexRetailersConfigs.AsNoTracking()
             .FirstOrDefaultAsync(c => c.RetailerHost == host && c.Enabled, ct);
 
@@ -48,14 +52,16 @@ public sealed class VtexOrderFormService
 
         var salesChannel = int.Parse(config.SalesChannels.Split(',').First());
 
-        // 🆕 Usar HttpClient del proxy service que sabemos que funciona
-        using var httpClient = proxyService.CreateProxyClient();
+        // 🍪 CONFIGURAR COOKIES PARA ESTE HOST
+        await SetupCookiesForHost(host, salesChannel);
 
-        _log.LogInformation("✅ Cliente HTTP configurado para {Host}. Sales Channel: {SC}", host, salesChannel);
+        // 🍪 CREAR CLIENTE CON COOKIES DEL MANAGER
+        using var httpClient = CreateClientWithCookieManager(host);
 
-        // 2. Obtener productos a testear
+        // 📋 OBTENER PRODUCTOS A TESTEAR
         var targetEans = await db.ProductsToTrack.AsNoTracking()
             .Select(p => p.EAN)
+            .Take(2) // Solo 2 para testing
             .ToListAsync(ct);
 
         var availableSkus = await db.Sellers.AsNoTracking()
@@ -70,68 +76,37 @@ public sealed class VtexOrderFormService
                 ProductName = s.Sku.Product.ProductName ?? "Sin nombre"
             })
             .Distinct()
-            .Take(10) // Limitamos para testing
+            .Take(1) // Solo 1 SKU para testing del flujo completo
             .ToListAsync(ct);
 
-        // 3. Obtener sucursales
-        var storeLocations = await db.VtexPickupPoints.AsNoTracking()
-            .Where(pp => pp.RetailerHost == host && pp.SourceIdSucursal.HasValue)
-            .Join(db.Sucursales.AsNoTracking(),
-                  pp => new { B = pp.SourceIdBandera!.Value, C = pp.SourceIdComercio!.Value, S = pp.SourceIdSucursal.Value },
-                  s => new { B = s.IdBandera, C = s.IdComercio, S = s.IdSucursal },
-                  (pp, s) => new StoreLocation
-                  {
-                      PickupPointId = pp.PickupPointId,
-                      PostalCode = s.SucursalesCodigoPostal,
-                      StoreName = s.SucursalesNombre
-                  })
-            .Take(5) // Limitamos para testing
-            .ToListAsync(ct);
-
-        _log.LogInformation("📊 Testing: {SkuCount} SKUs × {StoreCount} stores = {Total} combinaciones",
-            availableSkus.Count, storeLocations.Count, availableSkus.Count * storeLocations.Count);
-
-        // ⚠️ Verificación: Si no hay stores, no podemos testear
-        if (storeLocations.Count == 0)
+        if (availableSkus.Count == 0)
         {
-            _log.LogWarning("❌ No se encontraron pickup points mapeados para {Host}. Ejecuta primero el sweep de stores.", host);
-            _log.LogInformation("💡 Sugerencia: POST /api/operations/stores/sweep?hostFilter={Host}", Uri.EscapeDataString(host));
+            _log.LogWarning("⚠️ No se encontraron SKUs para testear en {Host}", host);
             return;
         }
 
-        // 4. Para cada combinación SKU + Store, hacer el flujo completo
+        // 🧪 FLUJO COMPLETO PARA CADA SKU
         foreach (var sku in availableSkus)
         {
-            foreach (var store in storeLocations)
+            _log.LogInformation("🧪 Testing flujo completo OrderForm: {Product}", sku.ProductName);
+
+            try
             {
-                _log.LogInformation("🧪 Testing: {Product} en {Store}", sku.ProductName, store.StoreName);
+                var result = await TestCompleteOrderFormFlowAsync(httpClient, host, salesChannel, sku, ct);
+                await SaveAvailabilityResultAsync(host, sku, "test-orderform", salesChannel, result, ct);
 
-                try
+                if (result.IsAvailable)
                 {
-                    var result = await TestSkuInStoreWithOrderFormAsync(
-                        httpClient, host, salesChannel, sku, store, ct);
-
-                    await SaveAvailabilityResultAsync(host, sku, store, salesChannel, result, ct);
-
-                    if (result.IsAvailable)
-                    {
-                        _log.LogInformation("✅ {Product} DISPONIBLE en {Store} - ${Price:F2}",
-                            sku.ProductName, store.StoreName, result.Price);
-                    }
-                    else
-                    {
-                        _log.LogInformation("❌ {Product} NO DISPONIBLE en {Store} - {Error}",
-                            sku.ProductName, store.StoreName, result.ErrorMessage);
-                    }
-
-                    // Pausa para no saturar la API
-                    await Task.Delay(200, ct);
+                    _log.LogInformation("🎉 ¡FLUJO EXITOSO! {Product} disponible - ${Price:F2}", sku.ProductName, result.Price);
                 }
-                catch (Exception ex)
+                else
                 {
-                    _log.LogError(ex, "💥 Error en flujo OrderForm para {Product} en {Store}",
-                        sku.ProductName, store.StoreName);
+                    _log.LogError("❌ Flujo falló para {Product}: {Error}", sku.ProductName, result.ErrorMessage);
                 }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "💥 Error en flujo OrderForm para {Product}", sku.ProductName);
             }
         }
 
@@ -139,103 +114,149 @@ public sealed class VtexOrderFormService
     }
 
     /// <summary>
-    /// Flujo completo de OrderForm para un SKU en una sucursal específica
+    /// 🍪 Configurar cookies para este host específico (REUTILIZA LÓGICA DEL SIMULATION SERVICE)
     /// </summary>
-    private async Task<AvailabilityResult> TestSkuInStoreWithOrderFormAsync(
-        HttpClient httpClient,
-        string host,
-        int salesChannel,
-        SkuToTest sku,
-        StoreLocation store,
-        CancellationToken ct)
+    private async Task SetupCookiesForHost(string host, int salesChannel)
     {
+        if (host.Contains("vea.com.ar"))
+        {
+            // 🍪 COOKIES DE VEA (las mismas que pusiste)
+            var veaCookies = "*vwo*uuid_v2=D141114DDECB39C78FDE0DA2F48546747|2ee47531154585f40ac2bd7c29301e2c; vtex-search-anonymous=5fc9a7ff55844ebeae13ae66986ae76a; checkout.vtex.com=__ofid=938ebb0c94c34808a9e9839b2093bb88; vtex_binding_address=veaargentina.myvtex.com/; *vwo*uuid=DDE37222879064FD7ABC4F579080F9076; *vis*opt_s=1%7C; locale=es-AR; VtexWorkspace=master%3A-; *fbp=fb.2.1758660348137.763496486246645936.Bg; VtexIdclientAutCookie*veaargentina=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; VtexIdclientAutCookie_1e29887f-4d43-484f-b512-2013f42600b1=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; vtex_session=eyJhbGciOiJFUzI1NiIsImtpZCI6IjhlYjAwZGVkLTJiZTYtNDU5My1hOTM1LTc0M2U5ZGI5ZTJkZSIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50LmlkIjpbXSwiaWQiOiI5OTIyNDY3Zi1kZmVjLTRhZDgtODc5Zi03NjNlNzM5ZTBmZDMiLCJ2ZXJzaW9uIjo0LCJzdWIiOiJzZXNzaW9uIiwiYWNjb3VudCI6InNlc3Npb24iLCJleHAiOjE3NTkzNTE1ODQsImlhdCI6MTc1ODY2MDM4NCwianRpIjoiMGJhMTY2YmYtYmExYS00Y2ZmLWE0NGItNjdmMWU5MzRlNGQwIiwiaXNzIjoic2Vzc2lvbi9kYXRhLXNpZ25lciJ9.ABYU09YDZfGphniwhtUVF8sZBXOlx2LMWiORDwtSuhdgXPrX1NOFa039zaNNtxogfS-V30_5VjkkvkpWRjyZTA; vtex_segment=eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIzNCIsInByaWNlVGFibGVzIjpudWxsLCJyZWdpb25JZCI6IlUxY2phblZ0WW05aGNtZGxiblJwYm1GMk9EWXdjMkZ1YkhWcGN3PT0iLCJ1dG1fY2FtcGFpZ24iOm51bGwsInV0bV9zb3VyY2UiOm51bGwsInV0bWlfY2FtcGFpZ24iOm51bGwsImN1cnJlbmN5Q29kZSI6IkFSUyIsImN1cnJlbmN5U3ltYm9sIjoiJCIsImNvdW50cnlDb2RlIjoiQVJHIiwiY3VsdHVyZUluZm8iOiJlcy1BUiIsImFkbWluX2N1bHR1cmVJbmZvIjoiZXMtQVIiLCJjaGFubmVsUHJpdmFjeSI6InB1YmxpYyJ9; vtex-search-session=5f9a75f8c4aa446a9ae9d8666a223a19; CheckoutOrderFormOwnership=";
+
+            _cookieManager.SetCookiesForHost(host, veaCookies);
+            _log.LogInformation("🍪 Cookies configuradas para VEA");
+        }
+        else if (host.Contains("jumbo.com.ar"))
+        {
+            // TODO: Configurar cookies de Jumbo cuando las tengas
+            _log.LogInformation("⚠️ Cookies de Jumbo no configuradas, usando defaults");
+        }
+        else if (host.Contains("disco.com.ar"))
+        {
+            // TODO: Configurar cookies de Disco cuando las tengas
+            _log.LogInformation("⚠️ Cookies de Disco no configuradas, usando defaults");
+        }
+        // ... más cadenas según tengas las cookies
+
+        // 🔧 ACTUALIZAR SEGMENT COOKIE CON EL SALES CHANNEL CORRECTO
+        _cookieManager.UpdateSegmentCookie(host, salesChannel);
+    }
+
+    /// <summary>
+    /// 🍪 Crear HttpClient usando el VtexCookieManager
+    /// </summary>
+    private HttpClient CreateClientWithCookieManager(string host)
+    {
+        // 🍪 OBTENER COOKIES DEL MANAGER
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var client = new HttpClient(handler);
+
+        // 🔧 HEADERS COMO NAVEGADOR REAL
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
+
+        client.Timeout = TimeSpan.FromSeconds(30);
+
+        _log.LogInformation("🍪 Cliente HTTP creado con cookies del VtexCookieManager para {Host}", host);
+        return client;
+    }
+
+    /// <summary>
+    /// 🧪 Flujo completo OrderForm: crear → agregar item → simular
+    /// </summary>
+    private async Task<AvailabilityResult> TestCompleteOrderFormFlowAsync(
+        HttpClient httpClient, string host, int salesChannel, SkuToTest sku, CancellationToken ct)
+    {
+        var result = new AvailabilityResult();
+
         try
         {
-            // PASO 1: Crear un orderForm vacío
+            // PASO 1: Crear orderForm
+            _log.LogInformation("PASO 1: Creando OrderForm...");
             var orderFormId = await CreateOrderFormAsync(httpClient, host, salesChannel, ct);
             if (string.IsNullOrEmpty(orderFormId))
             {
-                return new AvailabilityResult
-                {
-                    IsAvailable = false,
-                    ErrorMessage = "No se pudo crear orderForm"
-                };
+                result.ErrorMessage = "No se pudo crear orderForm";
+                return result;
             }
 
-            _log.LogDebug("📝 OrderForm creado: {OrderFormId}", orderFormId);
+            _log.LogInformation("✅ OrderForm creado: {OrderFormId}", orderFormId);
 
-            // PASO 2: Agregar el item al orderForm
-            var addItemResult = await AddItemToOrderFormAsync(httpClient, host, orderFormId, sku, ct);
-            if (!addItemResult.Success)
+            // PASO 2: Agregar item
+            _log.LogInformation("PASO 2: Agregando item {SkuId}...", sku.SkuId);
+            var addResult = await AddItemToOrderFormAsync(httpClient, host, orderFormId, sku, ct);
+            if (!addResult.Success)
             {
-                return new AvailabilityResult
-                {
-                    IsAvailable = false,
-                    ErrorMessage = $"No se pudo agregar item: {addItemResult.Error}",
-                    RawResponse = addItemResult.RawResponse
-                };
+                result.ErrorMessage = $"No se pudo agregar item: {addResult.Error}";
+                result.RawResponse = addResult.RawResponse;
+                return result;
             }
 
-            _log.LogDebug("➕ Item agregado al orderForm");
+            _log.LogInformation("✅ Item agregado correctamente");
 
-            // PASO 3: Simular shipping para la sucursal específica
-            var shippingResult = await SimulateShippingAsync(httpClient, host, orderFormId, store, ct);
-            if (!shippingResult.Success)
-            {
-                return new AvailabilityResult
-                {
-                    IsAvailable = false,
-                    ErrorMessage = $"Shipping simulation failed: {shippingResult.Error}",
-                    RawResponse = shippingResult.RawResponse
-                };
-            }
-
-            _log.LogDebug("🚚 Shipping simulado");
-
-            // PASO 4: Verificar el orderForm final para confirmar disponibilidad
+            // PASO 3: Simular (opcional - el item ya está en el orderForm)
+            _log.LogInformation("PASO 3: Verificando orderForm final...");
             var finalResult = await GetOrderFormAsync(httpClient, host, orderFormId, ct);
-            return ParseFinalOrderForm(finalResult, store.PickupPointId);
+            return ParseFinalOrderForm(finalResult);
+
         }
         catch (Exception ex)
         {
-            return new AvailabilityResult
-            {
-                IsAvailable = false,
-                ErrorMessage = ex.Message
-            };
+            result.ErrorMessage = ex.Message;
+            return result;
         }
     }
 
     /// <summary>
-    /// PASO 1: Crear orderForm vacío
+    /// PASO 1: Crear orderForm usando cookies del manager
     /// </summary>
     private async Task<string?> CreateOrderFormAsync(HttpClient httpClient, string host, int salesChannel, CancellationToken ct)
     {
-        // ✅ URL CORREGIDA: /orderForm SIN la S
-        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm?sc={salesChannel}";
-
-        using var content = new StringContent("{}", Encoding.UTF8, "application/json");
-        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
-
-        request.Headers.Add("Referer", host + "/");
-        request.Headers.Add("x-requested-with", "XMLHttpRequest");
-
-        using var response = await httpClient.SendAsync(request, ct);
-        var responseBody = await response.Content.ReadAsStringAsync(ct);
-
-        if (!response.IsSuccessStatusCode)
+        try
         {
-            _log.LogWarning("❌ Failed to create orderForm: HTTP {Status} - {Body}", response.StatusCode, responseBody);
+            var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm?sc={salesChannel}";
+
+            using var content = new StringContent("{}", Encoding.UTF8, "application/json");
+            using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+
+            request.Headers.Add("Referer", host + "/");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+
+            using var response = await httpClient.SendAsync(request, ct);
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+            _log.LogInformation("📊 CreateOrderForm: {Status} - Preview: {Preview}",
+                response.StatusCode,
+                responseBody.Length > 200 ? responseBody.Substring(0, 200) + "..." : responseBody);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(responseBody);
+            if (doc.RootElement.TryGetProperty("orderFormId", out var idElement))
+            {
+                return idElement.GetString();
+            }
+
             return null;
         }
-
-        using var doc = JsonDocument.Parse(responseBody);
-        if (doc.RootElement.TryGetProperty("orderFormId", out var idElement))
+        catch (Exception ex)
         {
-            return idElement.GetString();
+            _log.LogError(ex, "Error creating OrderForm");
+            return null;
         }
-
-        return null;
     }
 
     /// <summary>
@@ -244,110 +265,59 @@ public sealed class VtexOrderFormService
     private async Task<(bool Success, string? Error, string? RawResponse)> AddItemToOrderFormAsync(
         HttpClient httpClient, string host, string orderFormId, SkuToTest sku, CancellationToken ct)
     {
-        // ✅ URL CORREGIDA: /orderForm SIN la S
-        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/items";
-
-        var payload = new
+        try
         {
-            orderItems = new[]
+            var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/items";
+
+            var payload = new
             {
-                new
+                orderItems = new[]
                 {
-                    id = sku.SkuId,
-                    quantity = 1,
-                    seller = sku.SellerId
+                    new
+                    {
+                        id = sku.SkuId,
+                        quantity = 1,
+                        seller = sku.SellerId
+                    }
                 }
-            }
-        };
+            };
 
-        var json = JsonSerializer.Serialize(payload);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+            var json = JsonSerializer.Serialize(payload);
+            using var content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
 
-        request.Headers.Add("Referer", host + "/");
-        request.Headers.Add("x-requested-with", "XMLHttpRequest");
+            request.Headers.Add("Referer", host + "/");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
 
-        using var response = await httpClient.SendAsync(request, ct);
-        var responseBody = await response.Content.ReadAsStringAsync(ct);
+            using var response = await httpClient.SendAsync(request, ct);
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
 
-        if (!response.IsSuccessStatusCode)
-        {
-            return (false, $"HTTP {response.StatusCode}", responseBody);
-        }
-
-        // Verificar que el item se agregó correctamente
-        using var doc = JsonDocument.Parse(responseBody);
-        if (doc.RootElement.TryGetProperty("items", out var items) &&
-            items.ValueKind == JsonValueKind.Array &&
-            items.GetArrayLength() > 0)
-        {
-            var item = items[0];
-            if (item.TryGetProperty("availability", out var avail))
+            if (!response.IsSuccessStatusCode)
             {
-                var availability = avail.GetString();
-                if (availability != "available")
-                {
-                    return (false, $"Item not available: {availability}", responseBody);
-                }
+                return (false, $"HTTP {response.StatusCode}", responseBody);
             }
-            return (true, null, responseBody);
-        }
 
-        return (false, "No items in response", responseBody);
+            using var doc = JsonDocument.Parse(responseBody);
+            if (doc.RootElement.TryGetProperty("items", out var items) &&
+                items.ValueKind == JsonValueKind.Array &&
+                items.GetArrayLength() > 0)
+            {
+                return (true, null, responseBody);
+            }
+
+            return (false, "No items in response", responseBody);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message, null);
+        }
     }
 
     /// <summary>
-    /// PASO 3: Simular shipping para pickup en sucursal específica
-    /// </summary>
-    private async Task<(bool Success, string? Error, string? RawResponse)> SimulateShippingAsync(
-        HttpClient httpClient, string host, string orderFormId, StoreLocation store, CancellationToken ct)
-    {
-        // ✅ URL CORREGIDA: /orderForm SIN la S
-        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/attachments/shippingData";
-
-        var payload = new
-        {
-            address = new
-            {
-                addressType = "pickup",
-                country = "AR",
-                postalCode = store.PostalCode
-            },
-            logisticsInfo = new[]
-            {
-                new
-                {
-                    itemIndex = 0,
-                    selectedSla = store.PickupPointId,
-                    selectedDeliveryChannel = "pickup-in-point"
-                }
-            }
-        };
-
-        var json = JsonSerializer.Serialize(payload);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
-
-        request.Headers.Add("Referer", host + "/");
-        request.Headers.Add("x-requested-with", "XMLHttpRequest");
-
-        using var response = await httpClient.SendAsync(request, ct);
-        var responseBody = await response.Content.ReadAsStringAsync(ct);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            return (false, $"HTTP {response.StatusCode}", responseBody);
-        }
-
-        return (true, null, responseBody);
-    }
-
-    /// <summary>
-    /// PASO 4: Obtener orderForm final
+    /// PASO 3: Obtener orderForm final
     /// </summary>
     private async Task<string> GetOrderFormAsync(HttpClient httpClient, string host, string orderFormId, CancellationToken ct)
     {
-        // ✅ URL CORREGIDA: /orderForm SIN la S
         var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}";
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
@@ -358,142 +328,58 @@ public sealed class VtexOrderFormService
     }
 
     /// <summary>
-    /// Parsear el orderForm final para determinar disponibilidad real
+    /// Parsear orderForm final para determinar disponibilidad
     /// </summary>
-    private AvailabilityResult ParseFinalOrderForm(string responseBody, string expectedPickupPointId)
+    private AvailabilityResult ParseFinalOrderForm(string responseBody)
     {
+        var result = new AvailabilityResult { RawResponse = responseBody };
+
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
-            var result = new AvailabilityResult { RawResponse = responseBody };
 
-            // 1. Verificar items
+            // Verificar items
             if (doc.RootElement.TryGetProperty("items", out var items) &&
                 items.ValueKind == JsonValueKind.Array &&
                 items.GetArrayLength() > 0)
             {
                 var item = items[0];
 
-                // Verificar availability
                 if (item.TryGetProperty("availability", out var avail))
                 {
                     var availability = avail.GetString();
-                    if (availability != "available")
+                    if (availability == "available")
                     {
-                        result.IsAvailable = false;
+                        result.IsAvailable = true;
+
+                        if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spDecimal))
+                            result.Price = spDecimal / 100m;
+
+                        if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpDecimal))
+                            result.ListPrice = lpDecimal / 100m;
+                    }
+                    else
+                    {
                         result.ErrorMessage = $"Item availability: {availability}";
-                        return result;
                     }
-                }
-
-                // Extraer precios
-                if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spDecimal))
-                    result.Price = spDecimal / 100m;
-
-                if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpDecimal))
-                    result.ListPrice = lpDecimal / 100m;
-            }
-
-            // 2. Verificar shipping/logistics
-            if (doc.RootElement.TryGetProperty("shippingData", out var shipping) &&
-                shipping.TryGetProperty("logisticsInfo", out var logistics) &&
-                logistics.ValueKind == JsonValueKind.Array &&
-                logistics.GetArrayLength() > 0)
-            {
-                var logisticInfo = logistics[0];
-
-                if (logisticInfo.TryGetProperty("slas", out var slas) && slas.ValueKind == JsonValueKind.Array)
-                {
-                    bool foundValidPickup = false;
-
-                    foreach (var sla in slas.EnumerateArray())
-                    {
-                        if (sla.TryGetProperty("id", out var slaId) &&
-                            slaId.GetString() == expectedPickupPointId &&
-                            sla.TryGetProperty("deliveryChannel", out var dc) &&
-                            dc.GetString() == "pickup-in-point")
-                        {
-                            // Verificar que no tenga errores
-                            if (sla.TryGetProperty("pickupStoreInfo", out var storeInfo))
-                            {
-                                if (storeInfo.TryGetProperty("isPickupStore", out var isPickup) &&
-                                    isPickup.GetBoolean())
-                                {
-                                    foundValidPickup = true;
-                                    break;
-                                }
-                            }
-                            else
-                            {
-                                // Si no hay pickupStoreInfo pero el SLA está presente, asumimos que es válido
-                                foundValidPickup = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    result.IsAvailable = foundValidPickup;
-                    if (!foundValidPickup)
-                    {
-                        result.ErrorMessage = $"Pickup point {expectedPickupPointId} not available or not found";
-                    }
-                }
-                else
-                {
-                    result.IsAvailable = false;
-                    result.ErrorMessage = "No SLAs available";
                 }
             }
             else
             {
-                result.IsAvailable = false;
-                result.ErrorMessage = "No shipping data available";
-            }
-
-            // 3. Verificar si hay mensajes de error generales
-            if (doc.RootElement.TryGetProperty("messages", out var messages) &&
-                messages.ValueKind == JsonValueKind.Array &&
-                messages.GetArrayLength() > 0)
-            {
-                var errorMessages = new List<string>();
-                foreach (var msg in messages.EnumerateArray())
-                {
-                    if (msg.TryGetProperty("text", out var text))
-                    {
-                        errorMessages.Add(text.GetString() ?? "Unknown error");
-                    }
-                }
-
-                if (errorMessages.Any())
-                {
-                    result.IsAvailable = false;
-                    result.ErrorMessage = string.Join("; ", errorMessages);
-                }
+                result.ErrorMessage = "No items in orderForm";
             }
 
             return result;
         }
         catch (Exception ex)
         {
-            return new AvailabilityResult
-            {
-                IsAvailable = false,
-                ErrorMessage = $"Parse error: {ex.Message}",
-                RawResponse = responseBody
-            };
+            result.ErrorMessage = $"Parse error: {ex.Message}";
+            return result;
         }
     }
 
-    /// <summary>
-    /// Guardar resultado en BD
-    /// </summary>
-    private async Task SaveAvailabilityResultAsync(
-        string host,
-        SkuToTest sku,
-        StoreLocation store,
-        int salesChannel,
-        AvailabilityResult result,
-        CancellationToken ct)
+    // Guardar resultado (igual que antes)
+    private async Task SaveAvailabilityResultAsync(string host, SkuToTest sku, string pickupPointId, int salesChannel, AvailabilityResult result, CancellationToken ct)
     {
         const string sql = @"
 MERGE dbo.VtexStoreAvailability AS T
@@ -510,12 +396,12 @@ WHEN NOT MATCHED THEN
         await using var cmd = new SqlCommand(sql, cn);
 
         cmd.Parameters.AddWithValue("@host", host);
-        cmd.Parameters.AddWithValue("@pp", store.PickupPointId);
+        cmd.Parameters.AddWithValue("@pp", pickupPointId);
         cmd.Parameters.AddWithValue("@sku", sku.SkuId);
         cmd.Parameters.AddWithValue("@seller", sku.SellerId);
         cmd.Parameters.AddWithValue("@sc", salesChannel);
         cmd.Parameters.AddWithValue("@country", "AR");
-        cmd.Parameters.AddWithValue("@postal", store.PostalCode);
+        cmd.Parameters.AddWithValue("@postal", "");
         cmd.Parameters.AddWithValue("@avail", result.IsAvailable);
         cmd.Parameters.AddWithValue("@maxQty", result.IsAvailable ? 1 : 0);
         cmd.Parameters.AddWithValue("@price", (object?)result.Price ?? DBNull.Value);
@@ -533,13 +419,6 @@ WHEN NOT MATCHED THEN
         public string SellerId { get; set; } = default!;
         public string Ean { get; set; } = default!;
         public string ProductName { get; set; } = default!;
-    }
-
-    private sealed class StoreLocation
-    {
-        public string PickupPointId { get; set; } = default!;
-        public string PostalCode { get; set; } = default!;
-        public string StoreName { get; set; } = default!;
     }
 
     private sealed class AvailabilityResult

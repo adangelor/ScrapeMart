@@ -69,6 +69,7 @@ builder.Services.AddScoped<VtexApiTester>();
 builder.Services.AddScoped<VtexProxyService>();
 builder.Services.AddScoped<VtexSimpleSessionService>();
 builder.Services.AddScoped<VtexSimulationService>();
+builder.Services.AddSingleton<IVtexCookieManager, VtexCookieManager>();
 var app = builder.Build();
 
 // ===== CONFIGURACIÓN DEL PIPELINE =====

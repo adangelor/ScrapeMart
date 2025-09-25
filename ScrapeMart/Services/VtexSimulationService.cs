@@ -1,127 +1,291 @@
-﻿// File: Services/VtexSimulationService.cs
+﻿// File: Services/VtexSimulationService.cs - VERSIÓN NUCLEAR: TODOS los productos vs TODAS las cadenas
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
 using System.Text;
 using System.Text.Json;
+using System.Net;
 
 namespace ScrapeMart.Services;
 
 /// <summary>
-/// Enfoque directo: usar simulation endpoint en lugar del flujo completo de orderForm
+/// 🚀 VERSIÓN NUCLEAR: Testea TODOS los productos de ProductsToTrack en TODAS las cadenas VTEX
 /// </summary>
 public sealed class VtexSimulationService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<VtexSimulationService> _log;
     private readonly string _sqlConn;
+    private readonly IVtexCookieManager _cookieManager;
 
-    public VtexSimulationService(IServiceProvider serviceProvider, ILogger<VtexSimulationService> log, IConfiguration cfg)
+    public VtexSimulationService(
+        IServiceProvider serviceProvider,
+        ILogger<VtexSimulationService> log,
+        IConfiguration cfg,
+        IVtexCookieManager cookieManager)
     {
         _serviceProvider = serviceProvider;
         _log = log;
         _sqlConn = cfg.GetConnectionString("Default")!;
+        _cookieManager = cookieManager;
     }
 
     /// <summary>
-    /// Usar simulación directa en lugar del flujo completo
+    /// 🚀 MÉTODO NUCLEAR: Todos los productos vs todas las cadenas
     /// </summary>
-    public async Task ProbeAvailabilityWithSimulationAsync(string host, CancellationToken ct)
+    public async Task ProbeAvailabilityWithSimulationAsync(string? specificHost = null, CancellationToken ct = default)
     {
-        _log.LogInformation("🎯 Iniciando prueba DIRECTA de simulación para {Host}", host);
+        _log.LogInformation("🚀 INICIANDO BOMBARDEO NUCLEAR: TODOS los productos vs TODAS las cadenas VTEX");
 
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
-        var proxyService = scope.ServiceProvider.GetRequiredService<VtexProxyService>();
 
-        // Obtener configuración
-        var config = await db.VtexRetailersConfigs.AsNoTracking()
-            .FirstOrDefaultAsync(c => c.RetailerHost == host && c.Enabled, ct);
+        // 🏢 OBTENER TODAS LAS CADENAS HABILITADAS (o una específica)
+        var retailers = await db.VtexRetailersConfigs
+            .Where(r => r.Enabled && (specificHost == null || r.RetailerHost == specificHost))
+            .AsNoTracking()
+            .ToListAsync(ct);
 
-        if (config == null)
+        _log.LogInformation("🏢 Cadenas a procesar: {Count}", retailers.Count);
+        foreach (var retailer in retailers)
         {
-            _log.LogError("No se encontró configuración para {Host}", host);
-            return;
+            _log.LogInformation("  - {Host} (SC: {SalesChannels})", retailer.RetailerHost, retailer.SalesChannels);
         }
 
-        var salesChannel = int.Parse(config.SalesChannels.Split(',').First());
-
-        // Obtener productos a testear (limitado)
-        var targetEans = await db.ProductsToTrack.AsNoTracking()
-            .Select(p => p.EAN)
-            .ToListAsync(ct);
-
-        var availableSkus = await db.Sellers.AsNoTracking()
-            .Where(s => s.Sku.RetailerHost == host &&
-                       s.Sku.Ean != null &&
-                       targetEans.Contains(s.Sku.Ean))
-            .Select(s => new { s.Sku.ItemId, s.SellerId, s.Sku.Ean, ProductName = s.Sku.Product.ProductName ?? "Sin nombre" })
-            .Distinct()
-            .Take(5) // Solo 5 para testear
-            .ToListAsync(ct);
-
-        // Obtener sucursales
-        var storeLocations = await db.VtexPickupPoints.AsNoTracking()
-            .Where(pp => pp.RetailerHost == host && pp.SourceIdSucursal.HasValue)
-            .Join(db.Sucursales.AsNoTracking(),
-                  pp => new { B = pp.SourceIdBandera!.Value, C = pp.SourceIdComercio!.Value, S = pp.SourceIdSucursal.Value },
-                  s => new { B = s.IdBandera, C = s.IdComercio, S = s.IdSucursal },
-                  (pp, s) => new { pp.PickupPointId, s.SucursalesCodigoPostal, s.SucursalesNombre })
-            .Take(3) // Solo 3 sucursales para testear
-            .ToListAsync(ct);
-
-        _log.LogInformation("Testing: {SkuCount} SKUs × {StoreCount} stores", availableSkus.Count, storeLocations.Count);
-
-        using var httpClient = proxyService.CreateDirectClient(); // Usar conexión directa que sabemos que funciona
-
-        foreach (var sku in availableSkus)
-        {
-            foreach (var store in storeLocations)
+        // 📋 OBTENER TODOS LOS PRODUCTOS A TRACKEAR
+        var allProductsToTrack = await db.ProductsToTrack
+            .AsNoTracking()
+            .Select(p => new ProductToTest
             {
-                _log.LogInformation("🧪 Testing simulación: {Product} en {Store}", sku.ProductName, store.SucursalesNombre);
+                EAN = p.EAN,
+                Owner = p.Owner,
+                ProductName = p.ProductName ?? "Sin nombre"
+            })
+            .ToListAsync(ct);
 
-                try
-                {
-                    var result = await SimulatePickupDirectlyAsync(httpClient, host, salesChannel, sku.ItemId, sku.SellerId, store.PickupPointId, store.SucursalesCodigoPostal, ct);
+        _log.LogInformation("📋 Productos a trackear: {Count} ({AdecoCount} Adeco + {CompetitorCount} competencia)",
+            allProductsToTrack.Count,
+            allProductsToTrack.Count(p => p.Owner == "Adeco"),
+            allProductsToTrack.Count(p => p.Owner != "Adeco"));
 
-                    // Guardar resultado
-                    await SaveSimulationResultAsync(host, sku.ItemId, sku.SellerId, store.PickupPointId, salesChannel, result, ct);
+        // 🎯 ESTADÍSTICAS TOTALES
+        var totalCombinations = 0;
+        var successfulTests = 0;
+        var failedTests = 0;
 
-                    if (result.IsAvailable)
-                    {
-                        _log.LogInformation("✅ {Product} DISPONIBLE en {Store} - ${Price:F2}", sku.ProductName, store.SucursalesNombre, result.Price);
-                    }
-                    else
-                    {
-                        _log.LogInformation("❌ {Product} NO disponible en {Store} - {Error}", sku.ProductName, store.SucursalesNombre, result.Error);
-                    }
+        // 🚀 PROCESAR CADA CADENA
+        foreach (var retailer in retailers)
+        {
+            if (ct.IsCancellationRequested) break;
 
-                    await Task.Delay(500, ct); // Pausa entre requests
-                }
-                catch (Exception ex)
-                {
-                    _log.LogError(ex, "Error simulando {Product} en {Store}", sku.ProductName, store.SucursalesNombre);
-                }
+            _log.LogInformation("🏢 === PROCESANDO {Host} ===", retailer.RetailerHost);
+
+            try
+            {
+                var retailerResult = await ProcessRetailerAsync(retailer, allProductsToTrack, ct);
+
+                totalCombinations += retailerResult.TotalTests;
+                successfulTests += retailerResult.SuccessfulTests;
+                failedTests += retailerResult.FailedTests;
+
+                _log.LogInformation("✅ {Host} completado: {Success}/{Total} exitosos",
+                    retailer.RetailerHost, retailerResult.SuccessfulTests, retailerResult.TotalTests);
             }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "💥 Error procesando cadena {Host}", retailer.RetailerHost);
+                failedTests += allProductsToTrack.Count; // Asumir que todos fallaron
+            }
+
+            // Pausa entre cadenas
+            await Task.Delay(2000, ct);
         }
 
-        _log.LogInformation("Simulación completada para {Host}", host);
+        // 📊 REPORTE FINAL
+        _log.LogInformation("🎉 === BOMBARDEO NUCLEAR COMPLETADO ===");
+        _log.LogInformation("📊 ESTADÍSTICAS FINALES:");
+        _log.LogInformation("  🏢 Cadenas procesadas: {Retailers}", retailers.Count);
+        _log.LogInformation("  📋 Productos testeados: {Products}", allProductsToTrack.Count);
+        _log.LogInformation("  🎯 Total combinaciones: {Total}", totalCombinations);
+        _log.LogInformation("  ✅ Tests exitosos: {Success}", successfulTests);
+        _log.LogInformation("  ❌ Tests fallidos: {Failed}", failedTests);
+        _log.LogInformation("  📈 Tasa de éxito: {SuccessRate:P2}",
+            totalCombinations > 0 ? (double)successfulTests / totalCombinations : 0);
     }
 
     /// <summary>
-    /// Simulación directa usando endpoint de simulation
+    /// 🏢 Procesar una cadena específica contra todos los productos
     /// </summary>
-    private async Task<SimulationResult> SimulatePickupDirectlyAsync(
-        HttpClient httpClient,
-        string host,
-        int salesChannel,
-        string skuId,
-        string sellerId,
-        string pickupPointId,
-        string postalCode,
+    private async Task<RetailerTestResult> ProcessRetailerAsync(
+        Entities.VtexRetailersConfig retailer,
+        List<ProductToTest> allProducts,
         CancellationToken ct)
     {
-        var result = new SimulationResult();
+        var result = new RetailerTestResult();
+        var salesChannel = int.Parse(retailer.SalesChannels.Split(',').First());
+
+        // 🍪 CONFIGURAR COOKIES PARA ESTA CADENA
+        await SetupCookiesForRetailer(retailer.RetailerHost, salesChannel);
+
+        // 🍪 CREAR CLIENTE CON COOKIES DEL MANAGER
+        using var httpClient = CreateClientWithCookieManager(retailer.RetailerHost);
+
+        // 🔍 OBTENER SKUS DISPONIBLES EN ESTA CADENA PARA LOS PRODUCTOS TRACKEADOS
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDb>();
+
+        var targetEans = allProducts.Select(p => p.EAN).ToList();
+
+        var availableSkus = await db.Sellers
+            .Where(s => s.Sku.RetailerHost == retailer.RetailerHost &&
+                       s.Sku.Ean != null &&
+                       targetEans.Contains(s.Sku.Ean))
+            .Select(s => new SkuToTest
+            {
+                SkuId = s.Sku.ItemId,
+                SellerId = s.SellerId,
+                Ean = s.Sku.Ean!,
+                ProductName = allProducts.First(p => p.EAN == s.Sku.Ean).ProductName,
+                Owner = allProducts.First(p => p.EAN == s.Sku.Ean).Owner
+            })
+            .Distinct()
+            .AsNoTracking()
+            .ToListAsync(ct);
+
+        _log.LogInformation("🔍 {Host}: {SkusFound}/{TotalProducts} productos encontrados en catálogo",
+            retailer.RetailerHost, availableSkus.Count, allProducts.Count);
+
+        if (availableSkus.Count == 0)
+        {
+            _log.LogWarning("⚠️ {Host}: No se encontraron SKUs, saltando cadena", retailer.RetailerHost);
+            return result;
+        }
+
+        // 🎯 CONFIGURACIÓN DE PROCESAMIENTO PARALELO
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = 6, // Ajusta según tu capacidad
+            CancellationToken = ct
+        };
+
+        // 🚀 PROCESAR SKUS EN PARALELO
+        var results = new List<TestResult>();
+        var lockObject = new object();
+
+        await Parallel.ForEachAsync(availableSkus, parallelOptions, async (sku, token) =>
+        {
+            if (token.IsCancellationRequested) return;
+
+            try
+            {
+                var testResult = await TestSingleSkuAsync(httpClient, retailer.RetailerHost, salesChannel, sku, token);
+
+                lock (lockObject)
+                {
+                    results.Add(testResult);
+                    if (testResult.Success) result.SuccessfulTests++;
+                    result.TotalTests++;
+                }
+
+                // Log progreso cada 10 tests
+                if (result.TotalTests % 10 == 0)
+                {
+                    _log.LogInformation("📊 {Host}: {Completed}/{Total} tests completados",
+                        retailer.RetailerHost, result.TotalTests, availableSkus.Count);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "💥 Error testeando {Product} en {Host}", sku.ProductName, retailer.RetailerHost);
+                lock (lockObject)
+                {
+                    result.TotalTests++;
+                }
+            }
+        });
+
+        // 📊 GUARDAR TODOS LOS RESULTADOS EN BATCH
+        await SaveBatchResultsAsync(retailer.RetailerHost, salesChannel, results, ct);
+
+        // 📈 REPORTE POR CADENA
+        var adecoTests = results.Count(r => r.Sku.Owner == "Adeco");
+        var adecoSuccess = results.Count(r => r.Sku.Owner == "Adeco" && r.Success);
+
+        _log.LogInformation("📈 {Host} - RESUMEN:", retailer.RetailerHost);
+        _log.LogInformation("  📋 Total productos: {Total}", result.TotalTests);
+        _log.LogInformation("  ✅ Disponibles: {Success}", result.SuccessfulTests);
+        _log.LogInformation("  🏷️ Productos Adeco: {AdecoSuccess}/{AdecoTotal}", adecoSuccess, adecoTests);
+
+        return result;
+    }
+
+    /// <summary>
+    /// 🍪 Configurar cookies específicas por cadena
+    /// </summary>
+    private async Task SetupCookiesForRetailer(string host, int salesChannel)
+    {
+        // 🍪 COOKIES ESPECÍFICAS POR CADENA
+        if (host.Contains("vea.com.ar"))
+        {
+            var veaCookies = "*vwo*uuid_v2=D141114DDECB39C78FDE0DA2F48546747|2ee47531154585f40ac2bd7c29301e2c; vtex-search-anonymous=5fc9a7ff55844ebeae13ae66986ae76a; checkout.vtex.com=__ofid=938ebb0c94c34808a9e9839b2093bb88; vtex_binding_address=veaargentina.myvtex.com/; *vwo*uuid=DDE37222879064FD7ABC4F579080F9076; *vis*opt_s=1%7C; locale=es-AR; VtexWorkspace=master%3A-; *fbp=fb.2.1758660348137.763496486246645936.Bg; VtexIdclientAutCookie*veaargentina=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; VtexIdclientAutCookie_1e29887f-4d43-484f-b512-2013f42600b1=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; vtex_session=eyJhbGciOiJFUzI1NiIsImtpZCI6IjhlYjAwZGVkLTJiZTYtNDU5My1hOTM1LTc0M2U5ZGI5ZTJkZSIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50LmlkIjpbXSwiaWQiOiI5OTIyNDY3Zi1kZmVjLTRhZDgtODc5Zi03NjNlNzM5ZTBmZDMiLCJ2ZXJzaW9uIjo0LCJzdWIiOiJzZXNzaW9uIiwiYWNjb3VudCI6InNlc3Npb24iLCJleHAiOjE3NTkzNTE1ODQsImlhdCI6MTc1ODY2MDM4NCwianRpIjoiMGJhMTY2YmYtYmExYS00Y2ZmLWE0NGItNjdmMWU5MzRlNGQwIiwiaXNzIjoic2Vzc2lvbi9kYXRhLXNpZ25lciJ9.ABYU09YDZfGphniwhtUVF8sZBXOlx2LMWiORDwtSuhdgXPrX1NOFa039zaNNtxogfS-V30_5VjkkvkpWRjyZTA; vtex_segment=eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIzNCIsInByaWNlVGFibGVzIjpudWxsLCJyZWdpb25JZCI6IlUxY2phblZ0WW05aGNtZGxiblJwYm1GMk9EWXdjMkZ1YkhWcGN3PT0iLCJ1dG1fY2FtcGFpZ24iOm51bGwsInV0bV9zb3VyY2UiOm51bGwsInV0bWlfY2FtcGFpZ24iOm51bGwsImN1cnJlbmN5Q29kZSI6IkFSUyIsImN1cnJlbmN5U3ltYm9sIjoiJCIsImNvdW50cnlDb2RlIjoiQVJHIiwiY3VsdHVyZUluZm8iOiJlcy1BUiIsImFkbWluX2N1bHR1cmVJbmZvIjoiZXMtQVIiLCJjaGFubmVsUHJpdmFjeSI6InB1YmxpYyJ9; vtex-search-session=5f9a75f8c4aa446a9ae9d8666a223a19; CheckoutOrderFormOwnership=";
+            _cookieManager.SetCookiesForHost(host, veaCookies);
+            _log.LogInformation("🍪 VEA: Cookies específicas configuradas");
+        }
+        else if (host.Contains("jumbo.com.ar"))
+        {
+            // TODO: Agregar cookies de Jumbo cuando las tengas
+            _log.LogInformation("🍪 JUMBO: Usando cookies por defecto (agregar cookies específicas)");
+        }
+        else if (host.Contains("disco.com.ar"))
+        {
+            // TODO: Agregar cookies de Disco cuando las tengas
+            _log.LogInformation("🍪 DISCO: Usando cookies por defecto (agregar cookies específicas)");
+        }
+        else if (host.Contains("dia.com") || host.Contains("diaonline"))
+        {
+            _log.LogInformation("🍪 DIA: Usando cookies por defecto");
+        }
+        else if (host.Contains("carrefour.com.ar"))
+        {
+            _log.LogInformation("🍪 CARREFOUR: Usando cookies por defecto (agregar cookies específicas)");
+        }
+        else
+        {
+            _log.LogInformation("🍪 {Host}: Usando cookies por defecto", host);
+        }
+
+        // 🔧 ACTUALIZAR SEGMENT COOKIE
+        _cookieManager.UpdateSegmentCookie(host, salesChannel);
+    }
+
+    /// <summary>
+    /// 🍪 Crear HttpClient con cookies del manager
+    /// </summary>
+    private HttpClient CreateClientWithCookieManager(string host)
+    {
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var client = new HttpClient(handler);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
+        client.Timeout = TimeSpan.FromSeconds(30);
+
+        return client;
+    }
+
+    /// <summary>
+    /// 🧪 Testear un solo SKU
+    /// </summary>
+    private async Task<TestResult> TestSingleSkuAsync(HttpClient httpClient, string host, int salesChannel, SkuToTest sku, CancellationToken ct)
+    {
+        var result = new TestResult { Sku = sku };
 
         try
         {
@@ -129,29 +293,8 @@ public sealed class VtexSimulationService
 
             var payload = new
             {
-                items = new[]
-                {
-                    new
-                    {
-                        id = skuId,
-                        quantity = 1,
-                        seller = sellerId
-                    }
-                },
-                postalCode = postalCode,
-                country = "AR",
-                shippingData = new
-                {
-                    logisticsInfo = new[]
-                    {
-                        new
-                        {
-                            itemIndex = 0,
-                            selectedSla = pickupPointId,
-                            selectedDeliveryChannel = "pickup-in-point"
-                        }
-                    }
-                }
+                items = new[] { new { id = sku.SkuId, quantity = 1, seller = sku.SellerId } },
+                country = "ARG"
             };
 
             var json = JsonSerializer.Serialize(payload);
@@ -165,101 +308,126 @@ public sealed class VtexSimulationService
             var responseBody = await response.Content.ReadAsStringAsync(ct);
 
             result.RawResponse = responseBody;
+            result.StatusCode = (int)response.StatusCode;
 
-            if (!response.IsSuccessStatusCode)
+            if (response.IsSuccessStatusCode)
             {
-                result.Error = $"HTTP {response.StatusCode}";
-
-                if (responseBody.Contains("CHK003"))
+                using var doc = JsonDocument.Parse(responseBody);
+                if (doc.RootElement.TryGetProperty("items", out var items) && items.GetArrayLength() > 0)
                 {
-                    result.Error = "Bloqueado CHK003";
-                }
-                else if (responseBody.Contains("ORD002"))
-                {
-                    result.Error = "Carrito inválido";
-                }
+                    var item = items[0];
+                    if (item.TryGetProperty("availability", out var avail) && avail.GetString() == "available")
+                    {
+                        result.Success = true;
+                        result.IsAvailable = true;
 
-                return result;
-            }
-
-            // Parsear respuesta de simulación
-            using var doc = JsonDocument.Parse(responseBody);
-
-            // Verificar items
-            if (doc.RootElement.TryGetProperty("items", out var items) &&
-                items.ValueKind == JsonValueKind.Array &&
-                items.GetArrayLength() > 0)
-            {
-                var item = items[0];
-
-                if (item.TryGetProperty("availability", out var avail) && avail.GetString() == "available")
-                {
-                    result.IsAvailable = true;
-
-                    if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var price))
-                        result.Price = price / 100m;
-
-                    if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var listPrice))
-                        result.ListPrice = listPrice / 100m;
-                }
-                else
-                {
-                    result.Error = "Item no disponible";
+                        if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var price))
+                            result.Price = price / 100m;
+                    }
                 }
             }
             else
             {
-                result.Error = "Sin items en respuesta";
+                if (responseBody.Contains("CHK003")) result.ErrorMessage = "CHK003 - Bloqueado";
+                else if (responseBody.Contains("CHK002")) result.ErrorMessage = "CHK002 - Request inválido";
+                else result.ErrorMessage = $"HTTP {response.StatusCode}";
             }
 
             return result;
         }
         catch (Exception ex)
         {
-            result.Error = ex.Message;
+            result.ErrorMessage = ex.Message;
             return result;
         }
     }
 
-    private async Task SaveSimulationResultAsync(string host, string skuId, string sellerId, string pickupPointId, int salesChannel, SimulationResult result, CancellationToken ct)
+    /// <summary>
+    /// 💾 Guardar resultados en batch (más eficiente)
+    /// </summary>
+    private async Task SaveBatchResultsAsync(string host, int salesChannel, List<TestResult> results, CancellationToken ct)
     {
-        const string sql = @"
-MERGE dbo.VtexStoreAvailability AS T
-USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
-ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
-WHEN MATCHED THEN
-  UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
-WHEN NOT MATCHED THEN
-  INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,Currency,CapturedAtUtc,RawJson,ErrorMessage)
-  VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@curr,SYSUTCDATETIME(),@raw,@error);";
+        if (results.Count == 0) return;
 
-        await using var cn = new SqlConnection(_sqlConn);
-        await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
+        try
+        {
+            await using var connection = new SqlConnection(_sqlConn);
+            await connection.OpenAsync(ct);
 
-        cmd.Parameters.AddWithValue("@host", host);
-        cmd.Parameters.AddWithValue("@pp", pickupPointId);
-        cmd.Parameters.AddWithValue("@sku", skuId);
-        cmd.Parameters.AddWithValue("@seller", sellerId);
-        cmd.Parameters.AddWithValue("@sc", salesChannel);
-        cmd.Parameters.AddWithValue("@country", "AR");
-        cmd.Parameters.AddWithValue("@postal", "");
-        cmd.Parameters.AddWithValue("@avail", result.IsAvailable);
-        cmd.Parameters.AddWithValue("@maxQty", result.IsAvailable ? 1 : 0);
-        cmd.Parameters.AddWithValue("@price", (object?)result.Price ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@curr", "ARS");
-        cmd.Parameters.AddWithValue("@raw", (object?)result.RawResponse?.Substring(0, Math.Min(result.RawResponse.Length, 4000)) ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@error", (object?)result.Error ?? DBNull.Value);
+            using var transaction = connection.BeginTransaction();
 
-        await cmd.ExecuteNonQueryAsync(ct);
+            foreach (var result in results)
+            {
+                const string sql = @"
+                    MERGE dbo.VtexStoreAvailability AS T
+                    USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
+                    ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
+                    WHEN MATCHED THEN
+                      UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
+                    WHEN NOT MATCHED THEN
+                      INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,Currency,CapturedAtUtc,RawJson,ErrorMessage)
+                      VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@curr,SYSUTCDATETIME(),@raw,@error);";
+
+                await using var cmd = new SqlCommand(sql, connection, transaction);
+                cmd.Parameters.AddWithValue("@host", host);
+                cmd.Parameters.AddWithValue("@pp", "simulation-test");
+                cmd.Parameters.AddWithValue("@sku", result.Sku.SkuId);
+                cmd.Parameters.AddWithValue("@seller", result.Sku.SellerId);
+                cmd.Parameters.AddWithValue("@sc", salesChannel);
+                cmd.Parameters.AddWithValue("@country", "AR");
+                cmd.Parameters.AddWithValue("@postal", "");
+                cmd.Parameters.AddWithValue("@avail", result.IsAvailable);
+                cmd.Parameters.AddWithValue("@maxQty", result.IsAvailable ? 1 : 0);
+                cmd.Parameters.AddWithValue("@price", (object?)result.Price ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@curr", "ARS");
+                cmd.Parameters.AddWithValue("@raw", (object?)result.RawResponse?.Substring(0, Math.Min(result.RawResponse?.Length ?? 0, 4000)) ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@error", (object?)result.ErrorMessage ?? DBNull.Value);
+
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            transaction.Commit();
+            _log.LogInformation("💾 Guardados {Count} resultados para {Host}", results.Count, host);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "💥 Error guardando batch de {Count} resultados", results.Count);
+        }
     }
 
-    private sealed class SimulationResult
+    #region DTOs
+    private sealed class ProductToTest
     {
+        public string EAN { get; set; } = default!;
+        public string Owner { get; set; } = default!;
+        public string ProductName { get; set; } = default!;
+    }
+
+    private sealed class SkuToTest
+    {
+        public string SkuId { get; set; } = default!;
+        public string SellerId { get; set; } = default!;
+        public string Ean { get; set; } = default!;
+        public string ProductName { get; set; } = default!;
+        public string Owner { get; set; } = default!;
+    }
+
+    private sealed class TestResult
+    {
+        public SkuToTest Sku { get; set; } = default!;
+        public bool Success { get; set; }
         public bool IsAvailable { get; set; }
         public decimal? Price { get; set; }
-        public decimal? ListPrice { get; set; }
-        public string? Error { get; set; }
+        public int StatusCode { get; set; }
+        public string? ErrorMessage { get; set; }
         public string? RawResponse { get; set; }
     }
+
+    private sealed class RetailerTestResult
+    {
+        public int TotalTests { get; set; }
+        public int SuccessfulTests { get; set; }
+        public int FailedTests => TotalTests - SuccessfulTests;
+    }
+    #endregion
 }
