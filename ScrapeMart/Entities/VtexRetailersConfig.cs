@@ -11,6 +11,7 @@ public sealed class VtexRetailersConfig
     public string RetailerHost { get; set; } = default!;
     public string SalesChannels { get; set; } = default!;
     public bool Enabled { get; set; }
-    public string RetailerId { get; internal set; }
+    public string? RetailerId { get; internal set; }
+    public Retailer Retailer { get; set; } = default!;
 }
 

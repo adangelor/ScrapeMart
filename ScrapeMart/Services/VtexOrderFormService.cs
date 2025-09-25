@@ -1,4 +1,4 @@
-﻿// File: Services/VtexOrderFormService.cs - CORREGIDO para usar VtexCookieManager
+﻿// File: Services/VtexOrderFormService.cs - VERSIÓN COMPLETA
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
@@ -9,206 +9,290 @@ using System.Net;
 namespace ScrapeMart.Services;
 
 /// <summary>
-/// CORREGIDO: USA VtexCookieManager para flujo orderForm de todas las cadenas VTEX
+/// Servicio completo que verifica disponibilidad de TODOS los productos trackeados
+/// en TODAS las sucursales de TODAS las cadenas habilitadas usando OrderForm
 /// </summary>
 public sealed class VtexOrderFormService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<VtexOrderFormService> _log;
     private readonly string _sqlConn;
-    private readonly IVtexCookieManager _cookieManager; // 🍪 AGREGADO
+    private readonly IVtexCookieManager _cookieManager;
 
     public VtexOrderFormService(
         IServiceProvider serviceProvider,
         ILogger<VtexOrderFormService> log,
         IConfiguration cfg,
-        IVtexCookieManager cookieManager) // 🍪 INYECTADO
+        IVtexCookieManager cookieManager)
     {
         _serviceProvider = serviceProvider;
         _log = log;
         _sqlConn = cfg.GetConnectionString("Default")!;
-        _cookieManager = cookieManager; // 🍪 ASIGNADO
+        _cookieManager = cookieManager;
     }
 
     /// <summary>
-    /// 🛒 MÉTODO CORREGIDO: Flujo completo orderForm usando VtexCookieManager
+    /// 🚀 MÉTODO PRINCIPAL: Verifica disponibilidad completa
     /// </summary>
-    public async Task ProbeAvailabilityWithOrderFormAsync(string host, CancellationToken ct)
+    public async Task ProbeAvailabilityWithOrderFormAsync(string? specificHost = null, CancellationToken ct = default)
     {
-        _log.LogInformation("🛒 Iniciando flujo OrderForm con VtexCookieManager para {Host}", host);
+        _log.LogInformation("🚀 INICIANDO VERIFICACIÓN COMPLETA DE DISPONIBILIDAD");
 
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
 
-        // 🔧 OBTENER CONFIG DE LA CADENA
-        var config = await db.VtexRetailersConfigs.AsNoTracking()
-            .FirstOrDefaultAsync(c => c.RetailerHost == host && c.Enabled, ct);
-
-        if (config == null)
+        // 1️⃣ OBTENER TODAS LAS CADENAS HABILITADAS
+        var enabledRetailers = await GetEnabledRetailersAsync(db, specificHost, ct);
+        if (enabledRetailers.Count == 0)
         {
-            _log.LogError("❌ No se encontró configuración para {Host}", host);
+            _log.LogWarning("⚠️ No se encontraron cadenas habilitadas");
             return;
         }
 
-        var salesChannel = int.Parse(config.SalesChannels.Split(',').First());
-
-        // 🍪 CONFIGURAR COOKIES PARA ESTE HOST
-        await SetupCookiesForHost(host, salesChannel);
-
-        // 🍪 CREAR CLIENTE CON COOKIES DEL MANAGER
-        using var httpClient = CreateClientWithCookieManager(host);
-
-        // 📋 OBTENER PRODUCTOS A TESTEAR
-        var targetEans = await db.ProductsToTrack.AsNoTracking()
-            .Select(p => p.EAN)
-            .Take(2) // Solo 2 para testing
-            .ToListAsync(ct);
-
-        var availableSkus = await db.Sellers.AsNoTracking()
-            .Where(s => s.Sku.RetailerHost == host &&
-                       s.Sku.Ean != null &&
-                       targetEans.Contains(s.Sku.Ean))
-            .Select(s => new SkuToTest
-            {
-                SkuId = s.Sku.ItemId,
-                SellerId = s.SellerId,
-                Ean = s.Sku.Ean!,
-                ProductName = s.Sku.Product.ProductName ?? "Sin nombre"
-            })
-            .Distinct()
-            .Take(1) // Solo 1 SKU para testing del flujo completo
-            .ToListAsync(ct);
-
-        if (availableSkus.Count == 0)
+        // 2️⃣ OBTENER TODOS LOS PRODUCTOS A TRACKEAR
+        var productsToTrack = await GetProductsToTrackAsync(db, ct);
+        if (productsToTrack.Count == 0)
         {
-            _log.LogWarning("⚠️ No se encontraron SKUs para testear en {Host}", host);
+            _log.LogWarning("⚠️ No se encontraron productos para trackear");
             return;
         }
 
-        // 🧪 FLUJO COMPLETO PARA CADA SKU
-        foreach (var sku in availableSkus)
+        _log.LogInformation("📊 DATOS CARGADOS:");
+        _log.LogInformation("  🏢 Cadenas habilitadas: {RetailerCount}", enabledRetailers.Count);
+        _log.LogInformation("  📋 Productos a trackear: {ProductCount}", productsToTrack.Count);
+        _log.LogInformation("  📍 Total sucursales: {StoreCount}", enabledRetailers.Sum(r => r.StoreCount));
+
+        var totalResults = new ComprehensiveAvailabilityResult();
+
+        // 3️⃣ PROCESAR CADA CADENA
+        foreach (var retailer in enabledRetailers)
         {
-            _log.LogInformation("🧪 Testing flujo completo OrderForm: {Product}", sku.ProductName);
+            if (ct.IsCancellationRequested) break;
+
+            _log.LogInformation("🏢 === PROCESANDO {RetailerName} ({Host}) ===",
+                retailer.DisplayName, retailer.VtexHost);
 
             try
             {
-                var result = await TestCompleteOrderFormFlowAsync(httpClient, host, salesChannel, sku, ct);
-                await SaveAvailabilityResultAsync(host, sku, "test-orderform", salesChannel, result, ct);
+                var retailerResult = await ProcessRetailerCompleteAsync(retailer, productsToTrack, ct);
+                totalResults.RetailerResults[retailer.VtexHost] = retailerResult;
 
-                if (result.IsAvailable)
-                {
-                    _log.LogInformation("🎉 ¡FLUJO EXITOSO! {Product} disponible - ${Price:F2}", sku.ProductName, result.Price);
-                }
-                else
-                {
-                    _log.LogError("❌ Flujo falló para {Product}: {Error}", sku.ProductName, result.ErrorMessage);
-                }
+                _log.LogInformation("✅ {RetailerName} completado: {Available}/{Total} productos disponibles",
+                    retailer.DisplayName, retailerResult.AvailableProducts, retailerResult.TotalChecks);
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "💥 Error en flujo OrderForm para {Product}", sku.ProductName);
+                _log.LogError(ex, "❌ Error procesando {RetailerName}", retailer.DisplayName);
+                totalResults.RetailerResults[retailer.VtexHost] = new RetailerResult
+                {
+                    RetailerHost = retailer.VtexHost,
+                    ErrorMessage = ex.Message
+                };
+            }
+
+            // Pausa entre cadenas para evitar rate limiting
+            await Task.Delay(3000, ct);
+        }
+
+        // 4️⃣ REPORTE FINAL
+        LogFinalReport(totalResults);
+    }
+
+    /// <summary>
+    /// 🏢 Procesar una cadena específica contra todos sus productos y sucursales
+    /// </summary>
+    private async Task<RetailerResult> ProcessRetailerCompleteAsync(
+        RetailerInfo retailer,
+        List<ProductToTrack> allProducts,
+        CancellationToken ct)
+    {
+        var result = new RetailerResult { RetailerHost = retailer.VtexHost };
+        var salesChannel = retailer.SalesChannels.First();
+
+        // 🍪 CONFIGURAR COOKIES PARA ESTA CADENA
+        await SetupCookiesForRetailer(retailer.VtexHost, salesChannel);
+
+        // 🍪 CREAR CLIENTE CON COOKIES
+        using var httpClient = CreateClientWithCookieManager(retailer.VtexHost);
+
+        // 🔍 OBTENER PRODUCTOS QUE EXISTEN EN ESTA CADENA
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDb>();
+
+        var availableProducts = await GetAvailableProductsForRetailerAsync(db, retailer.VtexHost, allProducts, ct);
+
+        if (availableProducts.Count == 0)
+        {
+            _log.LogWarning("⚠️ {RetailerName}: No se encontraron productos en catálogo", retailer.DisplayName);
+            return result;
+        }
+
+        _log.LogInformation("📋 {RetailerName}: {Found}/{Total} productos encontrados en catálogo",
+            retailer.DisplayName, availableProducts.Count, allProducts.Count);
+
+        // 📍 OBTENER SUCURSALES DE ESTA CADENA
+        var stores = await GetStoresForRetailerAsync(db, retailer.RetailerId, ct);
+
+        if (stores.Count == 0)
+        {
+            _log.LogWarning("⚠️ {RetailerName}: No se encontraron sucursales", retailer.DisplayName);
+            return result;
+        }
+
+        _log.LogInformation("📍 {RetailerName}: {StoreCount} sucursales para verificar",
+            retailer.DisplayName, stores.Count);
+
+        // 🎯 CONFIGURACIÓN DE PROCESAMIENTO
+        var semaphore = new SemaphoreSlim(4, 4); // Máximo 4 requests paralelos por cadena
+        var tasks = new List<Task>();
+        var resultsLock = new object();
+
+        // 🚀 PROCESAR CADA COMBINACIÓN PRODUCTO x SUCURSAL
+        foreach (var product in availableProducts.Take(10)) // LIMITAR PARA TESTING - quitar Take en producción
+        {
+            foreach (var store in stores.Take(5)) // LIMITAR PARA TESTING - quitar Take en producción
+            {
+                if (ct.IsCancellationRequested) break;
+
+                var task = ProcessProductStoreAsync(
+                    httpClient, retailer, product, store, salesChannel,
+                    semaphore, result, resultsLock, ct);
+
+                tasks.Add(task);
+
+                // Control de memoria - procesar en batches
+                if (tasks.Count >= 20)
+                {
+                    await Task.WhenAll(tasks);
+                    tasks.Clear();
+                }
             }
         }
 
-        _log.LogInformation("🎉 Flujo OrderForm completado para {Host}", host);
+        // Esperar tareas restantes
+        if (tasks.Count > 0)
+        {
+            await Task.WhenAll(tasks);
+        }
+
+        return result;
     }
 
     /// <summary>
-    /// 🍪 Configurar cookies para este host específico (REUTILIZA LÓGICA DEL SIMULATION SERVICE)
+    /// 🧪 Verificar disponibilidad de un producto específico en una sucursal específica
     /// </summary>
-    private async Task SetupCookiesForHost(string host, int salesChannel)
+    private async Task ProcessProductStoreAsync(
+        HttpClient httpClient,
+        RetailerInfo retailer,
+        AvailableProduct product,
+        StoreInfo store,
+        int salesChannel,
+        SemaphoreSlim semaphore,
+        RetailerResult result,
+        object resultsLock,
+        CancellationToken ct)
     {
-        if (host.Contains("vea.com.ar"))
-        {
-            // 🍪 COOKIES DE VEA (las mismas que pusiste)
-            var veaCookies = "*vwo*uuid_v2=D141114DDECB39C78FDE0DA2F48546747|2ee47531154585f40ac2bd7c29301e2c; vtex-search-anonymous=5fc9a7ff55844ebeae13ae66986ae76a; checkout.vtex.com=__ofid=938ebb0c94c34808a9e9839b2093bb88; vtex_binding_address=veaargentina.myvtex.com/; *vwo*uuid=DDE37222879064FD7ABC4F579080F9076; *vis*opt_s=1%7C; locale=es-AR; VtexWorkspace=master%3A-; *fbp=fb.2.1758660348137.763496486246645936.Bg; VtexIdclientAutCookie*veaargentina=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; VtexIdclientAutCookie_1e29887f-4d43-484f-b512-2013f42600b1=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; vtex_session=eyJhbGciOiJFUzI1NiIsImtpZCI6IjhlYjAwZGVkLTJiZTYtNDU5My1hOTM1LTc0M2U5ZGI5ZTJkZSIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50LmlkIjpbXSwiaWQiOiI5OTIyNDY3Zi1kZmVjLTRhZDgtODc5Zi03NjNlNzM5ZTBmZDMiLCJ2ZXJzaW9uIjo0LCJzdWIiOiJzZXNzaW9uIiwiYWNjb3VudCI6InNlc3Npb24iLCJleHAiOjE3NTkzNTE1ODQsImlhdCI6MTc1ODY2MDM4NCwianRpIjoiMGJhMTY2YmYtYmExYS00Y2ZmLWE0NGItNjdmMWU5MzRlNGQwIiwiaXNzIjoic2Vzc2lvbi9kYXRhLXNpZ25lciJ9.ABYU09YDZfGphniwhtUVF8sZBXOlx2LMWiORDwtSuhdgXPrX1NOFa039zaNNtxogfS-V30_5VjkkvkpWRjyZTA; vtex_segment=eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIzNCIsInByaWNlVGFibGVzIjpudWxsLCJyZWdpb25JZCI6IlUxY2phblZ0WW05aGNtZGxiblJwYm1GMk9EWXdjMkZ1YkhWcGN3PT0iLCJ1dG1fY2FtcGFpZ24iOm51bGwsInV0bV9zb3VyY2UiOm51bGwsInV0bWlfY2FtcGFpZ24iOm51bGwsImN1cnJlbmN5Q29kZSI6IkFSUyIsImN1cnJlbmN5U3ltYm9sIjoiJCIsImNvdW50cnlDb2RlIjoiQVJHIiwiY3VsdHVyZUluZm8iOiJlcy1BUiIsImFkbWluX2N1bHR1cmVJbmZvIjoiZXMtQVIiLCJjaGFubmVsUHJpdmFjeSI6InB1YmxpYyJ9; vtex-search-session=5f9a75f8c4aa446a9ae9d8666a223a19; CheckoutOrderFormOwnership=";
-
-            _cookieManager.SetCookiesForHost(host, veaCookies);
-            _log.LogInformation("🍪 Cookies configuradas para VEA");
-        }
-        else if (host.Contains("jumbo.com.ar"))
-        {
-            // TODO: Configurar cookies de Jumbo cuando las tengas
-            _log.LogInformation("⚠️ Cookies de Jumbo no configuradas, usando defaults");
-        }
-        else if (host.Contains("disco.com.ar"))
-        {
-            // TODO: Configurar cookies de Disco cuando las tengas
-            _log.LogInformation("⚠️ Cookies de Disco no configuradas, usando defaults");
-        }
-        // ... más cadenas según tengas las cookies
-
-        // 🔧 ACTUALIZAR SEGMENT COOKIE CON EL SALES CHANNEL CORRECTO
-        _cookieManager.UpdateSegmentCookie(host, salesChannel);
-    }
-
-    /// <summary>
-    /// 🍪 Crear HttpClient usando el VtexCookieManager
-    /// </summary>
-    private HttpClient CreateClientWithCookieManager(string host)
-    {
-        // 🍪 OBTENER COOKIES DEL MANAGER
-        var cookieContainer = _cookieManager.GetCookieContainer(host);
-
-        var handler = new HttpClientHandler()
-        {
-            CookieContainer = cookieContainer,
-            UseCookies = true,
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
-        };
-
-        var client = new HttpClient(handler);
-
-        // 🔧 HEADERS COMO NAVEGADOR REAL
-        client.DefaultRequestHeaders.UserAgent.ParseAdd(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
-        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
-
-        client.Timeout = TimeSpan.FromSeconds(30);
-
-        _log.LogInformation("🍪 Cliente HTTP creado con cookies del VtexCookieManager para {Host}", host);
-        return client;
-    }
-
-    /// <summary>
-    /// 🧪 Flujo completo OrderForm: crear → agregar item → simular
-    /// </summary>
-    private async Task<AvailabilityResult> TestCompleteOrderFormFlowAsync(
-        HttpClient httpClient, string host, int salesChannel, SkuToTest sku, CancellationToken ct)
-    {
-        var result = new AvailabilityResult();
+        await semaphore.WaitAsync(ct);
 
         try
         {
-            // PASO 1: Crear orderForm
-            _log.LogInformation("PASO 1: Creando OrderForm...");
+            var availability = await TestProductAvailabilityAsync(
+                httpClient, retailer.VtexHost, salesChannel, product, store, ct);
+
+            // Guardar resultado en base de datos
+            await SaveAvailabilityResultAsync(retailer.VtexHost, store, product, availability, salesChannel, ct);
+
+            lock (resultsLock)
+            {
+                result.TotalChecks++;
+                if (availability.IsAvailable) result.AvailableProducts++;
+
+                if (result.TotalChecks % 50 == 0)
+                {
+                    _log.LogInformation("📊 {RetailerName}: {Completed} verificaciones completadas",
+                        retailer.DisplayName, result.TotalChecks);
+                }
+            }
+
+            if (availability.IsAvailable)
+            {
+                _log.LogDebug("✅ {Product} disponible en {Store} - ${Price:F2}",
+                    product.ProductName, store.StoreName, availability.Price);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "💥 Error verificando {Product} en {Store}",
+                product.ProductName, store.StoreName);
+
+            lock (resultsLock)
+            {
+                result.TotalChecks++;
+            }
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// 🧪 Testear disponibilidad usando OrderForm
+    /// </summary>
+    private async Task<AvailabilityTestResult> TestProductAvailabilityAsync(
+        HttpClient httpClient,
+        string host,
+        int salesChannel,
+        AvailableProduct product,
+        StoreInfo store,
+        CancellationToken ct)
+    {
+        var result = new AvailabilityTestResult
+        {
+            ProductEan = product.EAN,
+            SkuId = product.SkuId,
+            SellerId = product.SellerId
+        };
+
+        try
+        {
+            // PASO 1: Crear OrderForm
             var orderFormId = await CreateOrderFormAsync(httpClient, host, salesChannel, ct);
             if (string.IsNullOrEmpty(orderFormId))
             {
-                result.ErrorMessage = "No se pudo crear orderForm";
+                result.ErrorMessage = "No se pudo crear OrderForm";
                 return result;
             }
 
-            _log.LogInformation("✅ OrderForm creado: {OrderFormId}", orderFormId);
-
-            // PASO 2: Agregar item
-            _log.LogInformation("PASO 2: Agregando item {SkuId}...", sku.SkuId);
-            var addResult = await AddItemToOrderFormAsync(httpClient, host, orderFormId, sku, ct);
+            // PASO 2: Agregar producto al OrderForm
+            var addResult = await AddItemToOrderFormAsync(httpClient, host, orderFormId, product, ct);
             if (!addResult.Success)
             {
-                result.ErrorMessage = $"No se pudo agregar item: {addResult.Error}";
+                result.ErrorMessage = addResult.ErrorMessage;
                 result.RawResponse = addResult.RawResponse;
                 return result;
             }
 
-            _log.LogInformation("✅ Item agregado correctamente");
+            // PASO 3: Simular envío a la sucursal
+            var simulationResult = await SimulateShippingToStoreAsync(
+                httpClient, host, orderFormId, store, ct);
 
-            // PASO 3: Simular (opcional - el item ya está en el orderForm)
-            _log.LogInformation("PASO 3: Verificando orderForm final...");
-            var finalResult = await GetOrderFormAsync(httpClient, host, orderFormId, ct);
-            return ParseFinalOrderForm(finalResult);
+            if (simulationResult.Success)
+            {
+                result.IsAvailable = true;
+                result.Price = simulationResult.Price;
+                result.ListPrice = simulationResult.ListPrice;
+                result.AvailableQuantity = simulationResult.AvailableQuantity;
+                result.Currency = simulationResult.Currency;
+                result.RawResponse = simulationResult.RawResponse;
+            }
+            else
+            {
+                result.ErrorMessage = simulationResult.ErrorMessage;
+                result.RawResponse = simulationResult.RawResponse;
+            }
 
+            return result;
         }
         catch (Exception ex)
         {
@@ -218,7 +302,7 @@ public sealed class VtexOrderFormService
     }
 
     /// <summary>
-    /// PASO 1: Crear orderForm usando cookies del manager
+    /// 🛒 Crear OrderForm
     /// </summary>
     private async Task<string?> CreateOrderFormAsync(HttpClient httpClient, string host, int salesChannel, CancellationToken ct)
     {
@@ -233,38 +317,34 @@ public sealed class VtexOrderFormService
             request.Headers.Add("x-requested-with", "XMLHttpRequest");
 
             using var response = await httpClient.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode) return null;
+
             var responseBody = await response.Content.ReadAsStringAsync(ct);
-
-            _log.LogInformation("📊 CreateOrderForm: {Status} - Preview: {Preview}",
-                response.StatusCode,
-                responseBody.Length > 200 ? responseBody.Substring(0, 200) + "..." : responseBody);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                return null;
-            }
-
             using var doc = JsonDocument.Parse(responseBody);
-            if (doc.RootElement.TryGetProperty("orderFormId", out var idElement))
-            {
-                return idElement.GetString();
-            }
 
-            return null;
+            return doc.RootElement.TryGetProperty("orderFormId", out var idElement)
+                ? idElement.GetString()
+                : null;
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Error creating OrderForm");
+            _log.LogError(ex, "Error creando OrderForm para {Host}", host);
             return null;
         }
     }
 
     /// <summary>
-    /// PASO 2: Agregar item al orderForm
+    /// ➕ Agregar item al OrderForm
     /// </summary>
-    private async Task<(bool Success, string? Error, string? RawResponse)> AddItemToOrderFormAsync(
-        HttpClient httpClient, string host, string orderFormId, SkuToTest sku, CancellationToken ct)
+    private async Task<AddItemResult> AddItemToOrderFormAsync(
+        HttpClient httpClient,
+        string host,
+        string orderFormId,
+        AvailableProduct product,
+        CancellationToken ct)
     {
+        var result = new AddItemResult();
+
         try
         {
             var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/items";
@@ -275,9 +355,9 @@ public sealed class VtexOrderFormService
                 {
                     new
                     {
-                        id = sku.SkuId,
+                        id = product.SkuId,
                         quantity = 1,
-                        seller = sku.SellerId
+                        seller = product.SellerId
                     }
                 }
             };
@@ -291,10 +371,12 @@ public sealed class VtexOrderFormService
 
             using var response = await httpClient.SendAsync(request, ct);
             var responseBody = await response.Content.ReadAsStringAsync(ct);
+            result.RawResponse = responseBody;
 
             if (!response.IsSuccessStatusCode)
             {
-                return (false, $"HTTP {response.StatusCode}", responseBody);
+                result.ErrorMessage = $"HTTP {response.StatusCode}";
+                return result;
             }
 
             using var doc = JsonDocument.Parse(responseBody);
@@ -302,71 +384,242 @@ public sealed class VtexOrderFormService
                 items.ValueKind == JsonValueKind.Array &&
                 items.GetArrayLength() > 0)
             {
-                return (true, null, responseBody);
+                result.Success = true;
+            }
+            else
+            {
+                result.ErrorMessage = "No items in response";
             }
 
-            return (false, "No items in response", responseBody);
+            return result;
         }
         catch (Exception ex)
         {
-            return (false, ex.Message, null);
+            result.ErrorMessage = ex.Message;
+            return result;
         }
     }
 
     /// <summary>
-    /// PASO 3: Obtener orderForm final
+    /// 🚚 Simular envío a sucursal específica
     /// </summary>
-    private async Task<string> GetOrderFormAsync(HttpClient httpClient, string host, string orderFormId, CancellationToken ct)
+    private async Task<ShippingSimulationResult> SimulateShippingToStoreAsync(
+        HttpClient httpClient,
+        string host,
+        string orderFormId,
+        StoreInfo store,
+        CancellationToken ct)
     {
-        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}";
+        var result = new ShippingSimulationResult();
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Add("Referer", host + "/");
+        try
+        {
+            // Intentar con pickup point si está disponible
+            if (!string.IsNullOrEmpty(store.VtexPickupPointId))
+            {
+                result = await SimulatePickupAsync(httpClient, host, orderFormId, store, ct);
+                if (result.Success) return result;
+            }
 
-        using var response = await httpClient.SendAsync(request, ct);
-        return await response.Content.ReadAsStringAsync(ct);
+            // Fallback: simular delivery a la zona
+            result = await SimulateDeliveryAsync(httpClient, host, orderFormId, store, ct);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.ErrorMessage = ex.Message;
+            return result;
+        }
     }
 
     /// <summary>
-    /// Parsear orderForm final para determinar disponibilidad
+    /// 📦 Simular pickup en punto específico
     /// </summary>
-    private AvailabilityResult ParseFinalOrderForm(string responseBody)
+    private async Task<ShippingSimulationResult> SimulatePickupAsync(
+        HttpClient httpClient,
+        string host,
+        string orderFormId,
+        StoreInfo store,
+        CancellationToken ct)
     {
-        var result = new AvailabilityResult { RawResponse = responseBody };
+        var result = new ShippingSimulationResult();
+
+        try
+        {
+            var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/attachments/shippingData";
+
+            var payload = new
+            {
+                address = new
+                {
+                    addressType = "pickup",
+                    country = "ARG",
+                    postalCode = store.PostalCode,
+                    city = store.City,
+                    state = store.Province
+                },
+                logisticsInfo = new[]
+                {
+                    new
+                    {
+                        itemIndex = 0,
+                        selectedSla = store.VtexPickupPointId,
+                        selectedDeliveryChannel = "pickup-in-point"
+                    }
+                }
+            };
+
+            var json = JsonSerializer.Serialize(payload);
+            using var content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+
+            request.Headers.Add("Referer", host + "/");
+            request.Headers.Add("x-requested-with", "XMLHttpRequest");
+
+            using var response = await httpClient.SendAsync(request, ct);
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+            result.RawResponse = responseBody;
+
+            if (response.IsSuccessStatusCode)
+            {
+                result = ParseShippingResponse(responseBody);
+            }
+            else
+            {
+                result.ErrorMessage = $"Pickup simulation failed: HTTP {response.StatusCode}";
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.ErrorMessage = ex.Message;
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// 🚚 Simular delivery a zona
+    /// </summary>
+    private async Task<ShippingSimulationResult> SimulateDeliveryAsync(
+        HttpClient httpClient,
+        string host,
+        string orderFormId,
+        StoreInfo store,
+        CancellationToken ct)
+    {
+        var result = new ShippingSimulationResult();
+
+        try
+        {
+            var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForm/{orderFormId}/attachments/shippingData";
+
+            var payload = new
+            {
+                address = new
+                {
+                    addressType = "residential",
+                    country = "ARG",
+                    postalCode = store.PostalCode,
+                    city = store.City,
+                    state = store.Province,
+                    street = "Calle Test",
+                    number = "123"
+                },
+                logisticsInfo = new[]
+                {
+                    new
+                    {
+                        itemIndex = 0,
+                        selectedDeliveryChannel = "delivery"
+                    }
+                }
+            };
+
+            var json = JsonSerializer.Serialize(payload);
+            using var content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+
+            request.Headers.Add("Referer", host + "/");
+
+            using var response = await httpClient.SendAsync(request, ct);
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+            result.RawResponse = responseBody;
+
+            if (response.IsSuccessStatusCode)
+            {
+                result = ParseShippingResponse(responseBody);
+            }
+            else
+            {
+                result.ErrorMessage = $"Delivery simulation failed: HTTP {response.StatusCode}";
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.ErrorMessage = ex.Message;
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// 📋 Parsear respuesta de simulación de envío
+    /// </summary>
+    private ShippingSimulationResult ParseShippingResponse(string responseBody)
+    {
+        var result = new ShippingSimulationResult { RawResponse = responseBody };
 
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
 
-            // Verificar items
+            // Verificar items para obtener precios y disponibilidad
             if (doc.RootElement.TryGetProperty("items", out var items) &&
                 items.ValueKind == JsonValueKind.Array &&
                 items.GetArrayLength() > 0)
             {
                 var item = items[0];
 
-                if (item.TryGetProperty("availability", out var avail))
+                // Disponibilidad
+                if (item.TryGetProperty("availability", out var avail) && avail.GetString() == "available")
                 {
-                    var availability = avail.GetString();
-                    if (availability == "available")
-                    {
-                        result.IsAvailable = true;
+                    result.Success = true;
+                }
 
-                        if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var spDecimal))
-                            result.Price = spDecimal / 100m;
+                // Precios
+                if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var sellingPrice))
+                    result.Price = sellingPrice / 100m;
 
-                        if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var lpDecimal))
-                            result.ListPrice = lpDecimal / 100m;
-                    }
-                    else
-                    {
-                        result.ErrorMessage = $"Item availability: {availability}";
-                    }
+                if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var listPrice))
+                    result.ListPrice = listPrice / 100m;
+
+                // Cantidad disponible (si está en la respuesta)
+                if (item.TryGetProperty("quantity", out var qty) && qty.TryGetInt32(out var quantity))
+                    result.AvailableQuantity = quantity;
+            }
+
+            // Verificar logística para confirmar disponibilidad
+            if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) &&
+                logistics.ValueKind == JsonValueKind.Array &&
+                logistics.GetArrayLength() > 0)
+            {
+                var logistic = logistics[0];
+                if (logistic.TryGetProperty("slas", out var slas) &&
+                    slas.ValueKind == JsonValueKind.Array &&
+                    slas.GetArrayLength() > 0)
+                {
+                    // Si hay SLAs disponibles, el producto se puede enviar
+                    result.Success = true;
                 }
             }
-            else
+
+            // Moneda
+            if (doc.RootElement.TryGetProperty("storePreferencesData", out var preferences) &&
+                preferences.TryGetProperty("currencyCode", out var currency))
             {
-                result.ErrorMessage = "No items in orderForm";
+                result.Currency = currency.GetString() ?? "ARS";
             }
 
             return result;
@@ -378,57 +631,352 @@ public sealed class VtexOrderFormService
         }
     }
 
-    // Guardar resultado (igual que antes)
-    private async Task SaveAvailabilityResultAsync(string host, SkuToTest sku, string pickupPointId, int salesChannel, AvailabilityResult result, CancellationToken ct)
+    /// <summary>
+    /// 🏢 Obtener cadenas habilitadas
+    /// </summary>
+    private async Task<List<RetailerInfo>> GetEnabledRetailersAsync(AppDb db, string? specificHost, CancellationToken ct)
+    {
+        // Primero obtenemos los datos básicos que EF puede traducir a SQL
+        var rawData = await (
+            from retailer in db.Retailers.AsNoTracking()
+            join config in db.VtexRetailersConfigs.AsNoTracking() on retailer.RetailerId equals config.RetailerId
+            where config.Enabled && retailer.IsActive
+            where (specificHost == null || config.RetailerHost == specificHost)
+            select new
+            {
+                retailer.RetailerId,
+                retailer.DisplayName,
+                VtexHost = retailer.VtexHost ?? retailer.PublicHost!,
+                SalesChannelsString = config.SalesChannels, // Mantenemos como string
+                StoreCount = retailer.Stores.Count(s => s.IsActive)
+            }
+        ).ToListAsync(ct);
+
+        // Después procesamos en memoria para hacer el Split y Parse
+        var retailers = rawData.Select(r => new RetailerInfo
+        {
+            RetailerId = r.RetailerId,
+            DisplayName = r.DisplayName,
+            VtexHost = r.VtexHost,
+            SalesChannels = r.SalesChannelsString
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => int.TryParse(s.Trim(), out var result) ? result : 1)
+                .ToArray(),
+            StoreCount = r.StoreCount
+        }).ToList();
+
+        // Log de cadenas encontradas
+        foreach (var retailer in retailers)
+        {
+            _log.LogInformation("🏢 Cadena habilitada: {Name} ({Host}) - {StoreCount} sucursales - SC: [{SalesChannels}]",
+                retailer.DisplayName, retailer.VtexHost, retailer.StoreCount,
+                string.Join(",", retailer.SalesChannels));
+        }
+
+        return retailers;
+    }
+
+    /// <summary>
+    /// 📋 Obtener productos a trackear
+    /// </summary>
+    private async Task<List<ProductToTrack>> GetProductsToTrackAsync(AppDb db, CancellationToken ct)
+    {
+        var products = await db.ProductsToTrack
+            .Where(p => p.Track.HasValue && p.Track.Value == true)
+            .AsNoTracking()
+            .ToListAsync(ct); // Traemos todo a memoria primero
+
+        // Ahora procesamos en memoria para crear la estructura que necesitamos
+        var result = products.Select(p => new ProductToTrack
+        {
+            EAN = p.EAN,
+            Owner = p.Owner,
+            ProductName = p.ProductName
+        }).ToList();
+
+        _log.LogInformation("📋 Productos a trackear: {Total} ({Adeco} Adeco, {Others} otros)",
+            result.Count,
+            result.Count(p => p.Owner == "Adeco"),
+            result.Count(p => p.Owner != "Adeco"));
+
+        return result;
+    }
+
+    /// <summary>
+    /// 🔍 Obtener productos que existen en el catálogo de una cadena
+    /// </summary>
+    private async Task<List<AvailableProduct>> GetAvailableProductsForRetailerAsync(
+        AppDb db, string host, List<ProductToTrack> allProducts, CancellationToken ct)
+    {
+        var targetEans = allProducts.Select(p => p.EAN).ToList();
+
+        // Crear un diccionario para lookup rápido de productos por EAN
+        var productLookup = allProducts.ToDictionary(p => p.EAN, p => p);
+
+        // Hacer la consulta SQL básica sin operaciones complejas
+        var sellersData = await (
+            from seller in db.Sellers.AsNoTracking()
+            where seller.Sku.RetailerHost == host
+            where seller.Sku.Ean != null && targetEans.Contains(seller.Sku.Ean)
+            select new
+            {
+                EAN = seller.Sku.Ean!,
+                SkuId = seller.Sku.ItemId,
+                seller.SellerId
+            }
+        ).Distinct().ToListAsync(ct);
+
+        // Procesar en memoria para agregar información del producto
+        var availableProducts = sellersData
+            .Where(s => productLookup.ContainsKey(s.EAN)) // Por si acaso hay inconsistencias
+            .Select(s => new AvailableProduct
+            {
+                EAN = s.EAN,
+                SkuId = s.SkuId,
+                SellerId = s.SellerId,
+                ProductName = productLookup[s.EAN].ProductName ?? "Sin nombre",
+                Owner = productLookup[s.EAN].Owner
+            })
+            .ToList();
+
+        _log.LogInformation("🔍 {Host}: {Found}/{Total} productos encontrados en catálogo",
+            host, availableProducts.Count, allProducts.Count);
+
+        return availableProducts;
+    }
+
+    /// <summary>
+    /// 📍 Obtener sucursales de una cadena
+    /// </summary>
+    private async Task<List<StoreInfo>> GetStoresForRetailerAsync(AppDb db, string retailerId, CancellationToken ct)
+    {
+        var stores = await db.Stores
+            .AsNoTracking()
+            .Where(s => s.RetailerId == retailerId && s.IsActive)
+            .Where(s => !string.IsNullOrEmpty(s.PostalCode)) // Solo sucursales con código postal
+            .Select(s => new StoreInfo
+            {
+                StoreId = s.StoreId,
+                StoreName = s.StoreName,
+                City = s.City,
+                Province = s.Province,
+                PostalCode = s.PostalCode!,
+                VtexPickupPointId = s.VtexPickupPointId,
+                Latitude = (double)s.Latitude,
+                Longitude = (double)s.Longitude
+            })
+            .ToListAsync(ct);
+
+        return stores;
+    }
+
+    /// <summary>
+    /// 💾 Guardar resultado de disponibilidad
+    /// </summary>
+    private async Task SaveAvailabilityResultAsync(
+        string host,
+        StoreInfo store,
+        AvailableProduct product,
+        AvailabilityTestResult availability,
+        int salesChannel,
+        CancellationToken ct)
     {
         const string sql = @"
-MERGE dbo.VtexStoreAvailability AS T
-USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
-ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
-WHEN MATCHED THEN
-  UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
-WHEN NOT MATCHED THEN
-  INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,Currency,CapturedAtUtc,RawJson,ErrorMessage)
-  VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@curr,SYSUTCDATETIME(),@raw,@error);";
+            INSERT INTO dbo.AvailabilityResults 
+            (RetailerHost, StoreId, ProductEAN, SkuId, SellerId, SalesChannel,
+             IsAvailable, Price, ListPrice, AvailableQuantity, Currency, 
+             ErrorMessage, RawResponse, CheckedAt)
+            VALUES 
+            (@host, @storeId, @ean, @skuId, @sellerId, @sc,
+             @available, @price, @listPrice, @quantity, @currency,
+             @error, @rawResponse, GETUTCDATE())";
 
-        await using var cn = new SqlConnection(_sqlConn);
-        await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
+        try
+        {
+            await using var connection = new SqlConnection(_sqlConn);
+            await connection.OpenAsync(ct);
 
-        cmd.Parameters.AddWithValue("@host", host);
-        cmd.Parameters.AddWithValue("@pp", pickupPointId);
-        cmd.Parameters.AddWithValue("@sku", sku.SkuId);
-        cmd.Parameters.AddWithValue("@seller", sku.SellerId);
-        cmd.Parameters.AddWithValue("@sc", salesChannel);
-        cmd.Parameters.AddWithValue("@country", "AR");
-        cmd.Parameters.AddWithValue("@postal", "");
-        cmd.Parameters.AddWithValue("@avail", result.IsAvailable);
-        cmd.Parameters.AddWithValue("@maxQty", result.IsAvailable ? 1 : 0);
-        cmd.Parameters.AddWithValue("@price", (object?)result.Price ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@curr", result.Currency ?? "ARS");
-        cmd.Parameters.AddWithValue("@raw", (object?)result.RawResponse?.Substring(0, Math.Min(result.RawResponse.Length, 4000)) ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@error", (object?)result.ErrorMessage ?? DBNull.Value);
+            await using var command = new SqlCommand(sql, connection);
+            command.Parameters.AddWithValue("@host", host);
+            command.Parameters.AddWithValue("@storeId", store.StoreId);
+            command.Parameters.AddWithValue("@ean", product.EAN);
+            command.Parameters.AddWithValue("@skuId", product.SkuId);
+            command.Parameters.AddWithValue("@sellerId", product.SellerId);
+            command.Parameters.AddWithValue("@sc", salesChannel);
+            command.Parameters.AddWithValue("@available", availability.IsAvailable);
+            command.Parameters.AddWithValue("@price", (object?)availability.Price ?? DBNull.Value);
+            command.Parameters.AddWithValue("@listPrice", (object?)availability.ListPrice ?? DBNull.Value);
+            command.Parameters.AddWithValue("@quantity", availability.AvailableQuantity);
+            command.Parameters.AddWithValue("@currency", availability.Currency ?? "ARS");
+            command.Parameters.AddWithValue("@error", (object?)availability.ErrorMessage ?? DBNull.Value);
+            command.Parameters.AddWithValue("@rawResponse",
+                (object?)availability.RawResponse?.Substring(0, Math.Min(availability.RawResponse.Length, 4000)) ?? DBNull.Value);
 
-        await cmd.ExecuteNonQueryAsync(ct);
+            await command.ExecuteNonQueryAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error guardando resultado para {Product} en {Store}", product.ProductName, store.StoreName);
+        }
+    }
+
+    
+    /// <summary>
+    /// 🍪 Configurar cookies usando el VtexCookieManager
+    /// </summary>
+    private async Task SetupCookiesForRetailer(string host, int salesChannel)
+    {
+        _log.LogInformation("🍪 Configurando cookies para {Host} (SC: {SalesChannel})", host, salesChannel);
+
+        // El VtexCookieManager ya tiene toda la lógica de cookies específicas por cadena
+        // Solo necesitamos hacer warmup y actualizar el segment cookie
+
+        using var tempClient = CreateClientWithCookieManager(host);
+        await _cookieManager.WarmupCookiesAsync(tempClient, host);
+
+        // Actualizar segment cookie con sales channel correcto
+        _cookieManager.UpdateSegmentCookie(host, salesChannel);
+
+        _log.LogInformation("✅ Cookies configuradas para {Host}", host);
+    }
+
+    /// <summary>
+    /// 🍪 Crear HttpClient con cookies del manager
+    /// </summary>
+    private HttpClient CreateClientWithCookieManager(string host)
+    {
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var client = new HttpClient(handler);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
+        client.Timeout = TimeSpan.FromSeconds(30);
+
+        return client;
+    }
+
+    /// <summary>
+    /// 📊 Log del reporte final
+    /// </summary>
+    private void LogFinalReport(ComprehensiveAvailabilityResult totalResults)
+    {
+        _log.LogInformation("🎉 === REPORTE FINAL DE DISPONIBILIDAD ===");
+
+        var totalChecks = totalResults.RetailerResults.Values.Sum(r => r.TotalChecks);
+        var totalAvailable = totalResults.RetailerResults.Values.Sum(r => r.AvailableProducts);
+        var successRate = totalChecks > 0 ? (double)totalAvailable / totalChecks : 0;
+
+        _log.LogInformation("📊 ESTADÍSTICAS GENERALES:");
+        _log.LogInformation("  🏢 Cadenas procesadas: {Retailers}", totalResults.RetailerResults.Count);
+        _log.LogInformation("  🧪 Total verificaciones: {Total}", totalChecks);
+        _log.LogInformation("  ✅ Productos disponibles: {Available}", totalAvailable);
+        _log.LogInformation("  📈 Tasa de disponibilidad: {Rate:P2}", successRate);
+
+        _log.LogInformation("📋 DESGLOSE POR CADENA:");
+        foreach (var (host, result) in totalResults.RetailerResults)
+        {
+            var retailerRate = result.TotalChecks > 0 ? (double)result.AvailableProducts / result.TotalChecks : 0;
+            _log.LogInformation("  🏢 {Host}: {Available}/{Total} ({Rate:P2})",
+                host, result.AvailableProducts, result.TotalChecks, retailerRate);
+
+            if (!string.IsNullOrEmpty(result.ErrorMessage))
+            {
+                _log.LogWarning("    ❌ Error: {Error}", result.ErrorMessage);
+            }
+        }
     }
 
     #region DTOs
-    private sealed class SkuToTest
+
+    private sealed class RetailerInfo
     {
-        public string SkuId { get; set; } = default!;
-        public string SellerId { get; set; } = default!;
-        public string Ean { get; set; } = default!;
-        public string ProductName { get; set; } = default!;
+        public string RetailerId { get; set; } = default!;
+        public string DisplayName { get; set; } = default!;
+        public string VtexHost { get; set; } = default!;
+        public int[] SalesChannels { get; set; } = Array.Empty<int>();
+        public int StoreCount { get; set; }
     }
 
-    private sealed class AvailabilityResult
+    private sealed class ProductToTrack
     {
+        public string EAN { get; set; } = default!;
+        public string Owner { get; set; } = default!;
+        public string? ProductName { get; set; }
+    }
+
+    private sealed class AvailableProduct
+    {
+        public string EAN { get; set; } = default!;
+        public string SkuId { get; set; } = default!;
+        public string SellerId { get; set; } = default!;
+        public string ProductName { get; set; } = default!;
+        public string Owner { get; set; } = default!;
+    }
+
+    private sealed class StoreInfo
+    {
+        public long StoreId { get; set; }
+        public string StoreName { get; set; } = default!;
+        public string City { get; set; } = default!;
+        public string Province { get; set; } = default!;
+        public string PostalCode { get; set; } = default!;
+        public string? VtexPickupPointId { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+    }
+
+    private sealed class AvailabilityTestResult
+    {
+        public string ProductEan { get; set; } = default!;
+        public string SkuId { get; set; } = default!;
+        public string SellerId { get; set; } = default!;
         public bool IsAvailable { get; set; }
         public decimal? Price { get; set; }
         public decimal? ListPrice { get; set; }
+        public int AvailableQuantity { get; set; }
         public string Currency { get; set; } = "ARS";
         public string? ErrorMessage { get; set; }
         public string? RawResponse { get; set; }
     }
+
+    private sealed class AddItemResult
+    {
+        public bool Success { get; set; }
+        public string? ErrorMessage { get; set; }
+        public string? RawResponse { get; set; }
+    }
+
+    private sealed class ShippingSimulationResult
+    {
+        public bool Success { get; set; }
+        public decimal? Price { get; set; }
+        public decimal? ListPrice { get; set; }
+        public int AvailableQuantity { get; set; }
+        public string Currency { get; set; } = "ARS";
+        public string? ErrorMessage { get; set; }
+        public string? RawResponse { get; set; }
+    }
+
+    private sealed class RetailerResult
+    {
+        public string RetailerHost { get; set; } = default!;
+        public int TotalChecks { get; set; }
+        public int AvailableProducts { get; set; }
+        public string? ErrorMessage { get; set; }
+    }
+
+    private sealed class ComprehensiveAvailabilityResult
+    {
+        public Dictionary<string, RetailerResult> RetailerResults { get; set; } = new();
+    }
+
     #endregion
 }

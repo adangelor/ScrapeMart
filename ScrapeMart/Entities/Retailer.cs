@@ -44,5 +44,6 @@ namespace ScrapeMart.Entities
 
         // Navigation properties
         public ICollection<Store> Stores { get; set; } = new List<Store>();
+        public VtexRetailersConfig? VtexConfig { get; set; }    
     }
 }

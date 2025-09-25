@@ -16,4 +16,6 @@ public sealed class ProductToTrack
 
     [Column(TypeName = "nvarchar(255)")]
     public string? ProductName { get; set; }
+
+    public bool? Track { get; set; }
 }
