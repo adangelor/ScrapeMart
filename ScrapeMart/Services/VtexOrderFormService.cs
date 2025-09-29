@@ -1,4 +1,4 @@
-﻿// File: Services/VtexOrderFormService.cs - VERSIÓN COMPLETA
+﻿// File: Services/VtexOrderFormService.cs - VERSIÓN COMPLETA Y MODIFICADA
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
@@ -112,7 +112,7 @@ public sealed class VtexOrderFormService
         // 🍪 CONFIGURAR COOKIES PARA ESTA CADENA
         await SetupCookiesForRetailer(retailer.VtexHost, salesChannel);
 
-        // 🍪 CREAR CLIENTE CON COOKIES
+        // 🍪 CREAR CLIENTE CON COOKIES Y PROXY
         using var httpClient = CreateClientWithCookieManager(retailer.VtexHost);
 
         // 🔍 OBTENER PRODUCTOS QUE EXISTEN EN ESTA CADENA
@@ -196,6 +196,7 @@ public sealed class VtexOrderFormService
 
         try
         {
+            _log.LogInformation("Consultando sucursal {StoreName} con CP {PostalCode} para producto {Product}", store.StoreName, store.PostalCode, product.ProductName);
             var availability = await TestProductAvailabilityAsync(
                 httpClient, retailer.VtexHost, salesChannel, product, store, ct);
 
@@ -715,16 +716,17 @@ public sealed class VtexOrderFormService
 
         // Hacer la consulta SQL básica sin operaciones complejas
         var sellersData = await (
-            from seller in db.Sellers.AsNoTracking()
-            where seller.Sku.RetailerHost == host
-            where seller.Sku.Ean != null && targetEans.Contains(seller.Sku.Ean)
-            select new
-            {
-                EAN = seller.Sku.Ean!,
-                SkuId = seller.Sku.ItemId,
-                seller.SellerId
-            }
-        ).Distinct().ToListAsync(ct);
+                from seller in db.Sellers.AsNoTracking()
+                    // 👇👇👇 ACÁ USAMOS LA FUNCIÓN MAPEADA EN AMBOS LADOS 👇👇👇
+                where MyDbFunctions.NormalizeHost(seller.Sku.RetailerHost) == MyDbFunctions.NormalizeHost(host)
+                where seller.Sku.Ean != null && targetEans.Contains(seller.Sku.Ean)
+                select new
+                {
+                    EAN = seller.Sku.Ean!,
+                    SkuId = seller.Sku.ItemId,
+                    seller.SellerId
+                }
+            ).Distinct().ToListAsync(ct);
 
         // Procesar en memoria para agregar información del producto
         var availableProducts = sellersData
@@ -820,7 +822,7 @@ public sealed class VtexOrderFormService
         }
     }
 
-    
+
     /// <summary>
     /// 🍪 Configurar cookies usando el VtexCookieManager
     /// </summary>
@@ -846,12 +848,28 @@ public sealed class VtexOrderFormService
     private HttpClient CreateClientWithCookieManager(string host)
     {
         var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var config = _serviceProvider.GetRequiredService<IConfiguration>();
+        var proxyConfig = config.GetSection("Proxy");
+
         var handler = new HttpClientHandler()
         {
             CookieContainer = cookieContainer,
             UseCookies = true,
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
         };
+
+        var proxyUrl = proxyConfig["Url"];
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            var proxy = new WebProxy(new Uri(proxyUrl));
+            var username = proxyConfig["Username"];
+            if (!string.IsNullOrEmpty(username))
+            {
+                proxy.Credentials = new NetworkCredential(username, proxyConfig["Password"]);
+            }
+            handler.Proxy = proxy;
+            handler.UseProxy = true;
+        }
 
         var client = new HttpClient(handler);
         client.DefaultRequestHeaders.UserAgent.ParseAdd(
@@ -862,6 +880,7 @@ public sealed class VtexOrderFormService
 
         return client;
     }
+
 
     /// <summary>
     /// 📊 Log del reporte final

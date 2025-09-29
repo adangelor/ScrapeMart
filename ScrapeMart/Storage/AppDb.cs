@@ -1,5 +1,6 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Entities;
+using System.Reflection.Emit;
 
 namespace ScrapeMart.Storage
 {
@@ -33,11 +34,12 @@ namespace ScrapeMart.Storage
 
             b.Entity<Product>(e =>
             {
-                e.HasIndex(x => new { x.RetailerHost, x.ProductId }).IsUnique(); 
+                e.HasIndex(x => new { x.RetailerHost, x.ProductId }).IsUnique();
                 e.Property(x => x.RawJson).HasColumnType("nvarchar(max)");
             });
-            b.Entity<ProductAvailabilityReport>(e => {
-                e.HasNoKey(); 
+            b.Entity<ProductAvailabilityReport>(e =>
+            {
+                e.HasNoKey();
                 e.ToView("vw_ProductAvailabilityReport");
             });
             b.Entity<Sku>(e =>
@@ -82,11 +84,11 @@ namespace ScrapeMart.Storage
                 e.HasOne(x => x.Product).WithMany(x => x.Properties).HasForeignKey(x => x.ProductDbId);
             });
 
-             b.Entity<Category>(e =>
-            {
-                 e.HasIndex(x => new { x.RetailerHost, x.CategoryId }).IsUnique();
-                e.HasOne(x => x.Parent).WithMany(x => x.Children).HasForeignKey(x => x.ParentDbId);
-            });
+            b.Entity<Category>(e =>
+           {
+               e.HasIndex(x => new { x.RetailerHost, x.CategoryId }).IsUnique();
+               e.HasOne(x => x.Parent).WithMany(x => x.Children).HasForeignKey(x => x.ParentDbId);
+           });
 
             b.Entity<Sku>(e =>
             {
@@ -130,6 +132,11 @@ namespace ScrapeMart.Storage
                 e.HasIndex(x => x.CategoryId).IsUnique();
                 e.HasOne(x => x.Parent).WithMany(x => x.Children).HasForeignKey(x => x.ParentDbId);
             });
+
+            b.HasDbFunction(typeof(MyDbFunctions)
+            .GetMethod(nameof(MyDbFunctions.NormalizeHost), new[] { typeof(string) }))
+                    .HasName("NormalizeHost")  // El nombre de la función en SQL
+                    .HasSchema("dbo");         // El esquema de la función en SQL
         }
     }
 

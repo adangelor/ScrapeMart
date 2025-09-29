@@ -2,6 +2,7 @@
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Services;
 using ScrapeMart.Storage;
+using System.Text.Json;
 
 namespace ScrapeMart.Endpoints;
 
@@ -256,7 +257,92 @@ public static class DashboardEndpoints
             })
             .WithName("TestWorkingFlow")
             .WithSummary("Flujo que SÍ funciona - evita pickup points problemáticos");
+        group.MapPost("/discovery/products-in-all-chains",
+    async ([FromServices] VtexProductDiscoveryService service,
+           string? specificHost,
+           CancellationToken ct) =>
+    {
+        var result = await service.DiscoverAllProductsInAllChainsAsync(specificHost, ct);
+        return Results.Ok(result);
+    })
+    .WithName("DiscoverProductsInAllChains")
+    .WithSummary("🔍 Descubre TODOS los SKUs y sellers para productos de ProductsToTrack en TODAS las cadenas")
+    .WithDescription(@"
+        Busca todos los productos de la tabla ProductsToTrack en todas las cadenas VTEX habilitadas.
+        Para cada producto encontrado, extrae todos sus SKUs y sellers.
+        Persiste la información en las tablas VtexProducts, VtexSkus y VtexSkuSellers.
+        
+        Parámetros:
+        - specificHost: (opcional) Si se especifica, solo procesa esa cadena. Ej: 'https://www.vea.com.ar'
+        
+        Este proceso es útil para:
+        - Mapear qué productos existen en cada cadena
+        - Identificar todos los SKUs disponibles para cada producto
+        - Conocer todos los sellers que venden cada SKU
+        - Preparar el terreno para posteriores chequeos de disponibilidad
+        
+        El proceso es paralelo pero controlado para no saturar las APIs de VTEX.");
 
+        group.MapPost("/discovery/quick-search",
+     async ([FromBody] QuickSearchRequest request,
+            [FromServices] IHttpClientFactory httpFactory, // ✅ Inyectamos el factory directamente
+            CancellationToken ct) =>
+     {
+         // NO CREES UN SCOPE MANUALMENTE. ASP.NET YA LO HACE.
+         var http = httpFactory.CreateClient("vtexSession"); // Usamos el factory inyectado
+
+         var results = new List<object>();
+
+         foreach (var ean in request.Eans)
+         {
+             try
+             {
+                 var searchUrl = $"{request.Host.TrimEnd('/')}/api/catalog_system/pub/products/search?ft={ean}&_from=0&_to=0";
+                 var response = await http.GetAsync(searchUrl, ct);
+
+                 if (response.IsSuccessStatusCode)
+                 {
+                     var json = await response.Content.ReadAsStringAsync(ct);
+
+                     if (!string.IsNullOrEmpty(json) && json != "[]")
+                     {
+                         using var doc = JsonDocument.Parse(json);
+                         if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
+                         {
+                             // ... tu código de parseo ...
+                             results.Add(new { EAN = ean, Found = true, /* ...otros campos */ });
+                         }
+                         else
+                         {
+                             results.Add(new { EAN = ean, Found = false });
+                         }
+                     }
+                     else
+                     {
+                         results.Add(new { EAN = ean, Found = false });
+                     }
+                 }
+                 else
+                 {
+                     results.Add(new { EAN = ean, Found = false, Error = $"HTTP {response.StatusCode}" });
+                 }
+             }
+             catch (Exception ex)
+             {
+                 results.Add(new { EAN = ean, Found = false, Error = ex.Message });
+             }
+         }
+
+         return Results.Ok(new
+         {
+             Host = request.Host,
+             TotalSearched = request.Eans.Count,
+             TotalFound = results.Count(r => (bool)(r.GetType().GetProperty("Found")?.GetValue(r) ?? false)),
+             Results = results
+         });
+     })
+     .WithName("QuickProductSearch")
+     .WithSummary("🔍 Búsqueda rápida de productos por EAN");
 
         return group;
     }
@@ -303,4 +389,14 @@ public sealed class MissingProductInfo
     public int TotalStores { get; set; }
     public int StoresWithProduct { get; set; }
     public decimal MissingPercentage { get; set; }
+}
+
+
+// ===================================================================
+// DTOs para el endpoint QuickSearch (agregar al final del archivo)
+// ===================================================================
+public sealed class QuickSearchRequest
+{
+    public string Host { get; set; } = default!;
+    public List<string> Eans { get; set; } = new();
 }
