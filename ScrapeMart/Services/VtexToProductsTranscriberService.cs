@@ -1,13 +1,16 @@
-﻿using Microsoft.Data.SqlClient;
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Entities;
 using ScrapeMart.Storage;
-using System.Data;
-using System.Linq;
 using System.Text.Json;
+using Dapper;
+using Microsoft.Data.SqlClient;
 
 namespace ScrapeMart.Services;
 
+/// <summary>
+/// Transcribe la jerarquía completa (Producto -> SKU -> Seller -> Oferta)
+/// desde las tablas VTEX de escenario hacia las tablas finales del modelo de datos.
+/// </summary>
 public sealed class VtexToProductsTranscriberService
 {
     private readonly AppDb _db;
@@ -24,40 +27,39 @@ public sealed class VtexToProductsTranscriberService
         _log = log;
     }
 
-    /// <summary>
-    /// Transcribe productos desde las tablas VTEX raw hacia la tabla Products definitiva
-    /// </summary>
-    public async Task<TranscriptionResult> TranscribeProductsAsync(
+    public async Task<TranscriptionResult> TranscribeAllAsync(
         string host,
         int batchSize = 100,
         CancellationToken ct = default)
     {
         var result = new TranscriptionResult { Host = host };
-
-        _log.LogInformation("Iniciando transcripción de productos VTEX para host: {Host}", host);
+        _log.LogInformation("Iniciando transcripción COMPLETA para host: {Host}", host);
 
         try
         {
-            // Obtener productos de las tablas raw VTEX que no han sido procesados recientemente
-            var vtexProducts = await GetVtexProductsToTranscribeAsync(host, ct);
-            result.TotalVtexProducts = vtexProducts.Count;
+            await using var connection = new SqlConnection(_sqlConn);
+            var productIdsToProcess = (await connection.QueryAsync<int>(
+                "SELECT ProductId FROM dbo.VtexProducts WHERE RetailerHost = @host",
+                new { host })).AsList();
 
-            _log.LogInformation("Encontrados {Count} productos VTEX para transcribir", vtexProducts.Count);
+            result.TotalVtexProducts = productIdsToProcess.Count();
+            _log.LogInformation("Encontrados {Count} productos en VtexProducts para transcribir", result.TotalVtexProducts);
 
-            if (vtexProducts.Count == 0)
+            if (!productIdsToProcess.Any())
             {
-                _log.LogInformation("No hay productos VTEX para transcribir en host: {Host}", host);
+                result.MarkCompleted();
                 return result;
             }
 
-            // Procesar en lotes
-            for (int i = 0; i < vtexProducts.Count; i += batchSize)
+            for (int i = 0; i < result.TotalVtexProducts; i += batchSize)
             {
-                var batch = vtexProducts.Skip(i).Take(batchSize).ToList();
-                await ProcessBatchAsync(host, batch, result, ct);
+                var batchIds = productIdsToProcess.Skip(i).Take(batchSize).ToList();
+                if (!batchIds.Any()) continue; // Control por si las dudas
+
+                await ProcessBatchAsync(host, batchIds, result, ct);
 
                 _log.LogInformation("Procesado lote {Current}/{Total}",
-                    Math.Min(i + batchSize, vtexProducts.Count), vtexProducts.Count);
+                    Math.Min(i + batchSize, result.TotalVtexProducts), result.TotalVtexProducts);
 
                 if (ct.IsCancellationRequested)
                 {
@@ -65,87 +67,48 @@ public sealed class VtexToProductsTranscriberService
                     break;
                 }
             }
-
-            _log.LogInformation("Transcripción completada para {Host}. Procesados: {Processed}, Nuevos: {New}, Actualizados: {Updated}, Errores: {Errors}",
-                host, result.ProductsProcessed, result.ProductsInserted, result.ProductsUpdated, result.ProductsWithErrors);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Error durante la transcripción para host: {Host}", host);
+            _log.LogError(ex, "Error fatal durante la transcripción para host: {Host}", host);
             result.ErrorMessage = ex.Message;
         }
+
+        result.MarkCompleted();
+        _log.LogInformation("Transcripción completada para {Host}. Procesados: {Processed}, Nuevos: {New}, Actualizados: {Updated}, Errores: {Errors}",
+            host, result.ProductsProcessed, result.ProductsInserted, result.ProductsUpdated, result.ProductsWithErrors);
 
         return result;
     }
 
-    private async Task<List<VtexProductData>> GetVtexProductsToTranscribeAsync(string host, CancellationToken ct)
-    {
-        const string sql = @"
-            SELECT 
-                vp.ProductId,
-                vp.ProductName,
-                vp.Brand,
-                vp.LinkText,
-                vp.Categories,
-                vp.FirstSeenUtc,
-                vp.LastSeenUtc
-            FROM dbo.VtexProducts vp
-            WHERE vp.RetailerHost = @host
-            AND vp.LastSeenUtc >= DATEADD(hour, -36, SYSUTCDATETIME()) -- Solo productos vistos en las últimas 24h
-            ORDER BY vp.LastSeenUtc DESC";
-
-        var products = new List<VtexProductData>();
-
-        await using var cn = new SqlConnection(_sqlConn);
-        await cn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, cn);
-        cmd.Parameters.AddWithValue("@host", host);
-
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-        {
-            products.Add(new VtexProductData
-            {
-                ProductId = reader.GetInt32("ProductId"),
-                ProductName = reader.IsDBNull("ProductName") ? null : reader.GetString("ProductName"),
-                Brand = reader.IsDBNull("Brand") ? null : reader.GetString("Brand"),
-                LinkText = reader.IsDBNull("LinkText") ? null : reader.GetString("LinkText"),
-                Categories = reader.IsDBNull("Categories") ? null : reader.GetString("Categories"),
-                FirstSeenUtc = reader.IsDBNull("FirstSeenUtc") ? null : reader.GetDateTime("FirstSeenUtc"),
-                LastSeenUtc = reader.GetDateTime("LastSeenUtc")
-            });
-        }
-
-        return products;
-    }
-
     private async Task ProcessBatchAsync(
         string host,
-        List<VtexProductData> batch,
+        List<int> productIds,
         TranscriptionResult result,
         CancellationToken ct)
     {
-        var productIds = batch.Select(p => p.ProductId).ToList();
+        var rawProducts = await GetRawProductDataForBatchAsync(host, productIds, ct);
 
-        // Obtener productos existentes en la tabla definitiva
         var existingProducts = await _db.Products
+            .Include(p => p.Skus)
+                .ThenInclude(s => s.Sellers)
             .Where(p => p.RetailerHost == host && productIds.Contains(p.ProductId))
             .ToDictionaryAsync(p => p.ProductId, p => p, ct);
 
-        foreach (var vtexProduct in batch)
+        foreach (var rawProduct in rawProducts)
         {
             try
             {
-                var isNew = !existingProducts.TryGetValue(vtexProduct.ProductId, out var product);
-
-                if (isNew)
+                var isNewProduct = !existingProducts.TryGetValue(rawProduct.ProductId, out var finalProduct);
+                if (isNewProduct)
                 {
-                    product = new Product
+                    finalProduct = new Product
                     {
-                        ProductId = vtexProduct.ProductId,
-                        RetailerHost = host
+                        ProductId = rawProduct.ProductId,
+                        RetailerHost = host,
+                        ReleaseDateUtc = rawProduct.FirstSeenUtc
                     };
-                    _db.Products.Add(product);
+                    _db.Products.Add(finalProduct);
                     result.ProductsInserted++;
                 }
                 else
@@ -153,85 +116,140 @@ public sealed class VtexToProductsTranscriberService
                     result.ProductsUpdated++;
                 }
 
-                // Mapear campos desde VTEX a Product
-                product.ProductName = vtexProduct.ProductName;
-                product.Brand = vtexProduct.Brand;
-                product.LinkText = vtexProduct.LinkText;
+                finalProduct.ProductName = rawProduct.ProductName;
+                finalProduct.Brand = rawProduct.Brand;
+                finalProduct.LinkText = rawProduct.LinkText;
 
-                // Si hay categorías en formato "cat1 | cat2 | cat3", tomar la primera
-                if (!string.IsNullOrEmpty(vtexProduct.Categories))
+                foreach (var rawSku in rawProduct.Skus)
                 {
-                    var categories = vtexProduct.Categories.Split(" | ", StringSplitOptions.RemoveEmptyEntries);
-                    if (categories.Length > 0)
+                    var finalSku = finalProduct.Skus.FirstOrDefault(s => s.ItemId == rawSku.SkuId.ToString());
+                    if (finalSku is null)
                     {
-                        // Limpiar cualquier barra inicial/final de la categoría
-                        product.CategoryId = categories[0].Trim('/');
+                        finalSku = new Sku
+                        {
+                            ItemId = rawSku.SkuId.ToString(),
+                            Product = finalProduct,
+                            RetailerHost = host
+                        };
+                        finalProduct.Skus.Add(finalSku);
+                    }
+
+                    finalSku.Name = rawSku.SkuName;
+                    finalSku.Ean = rawSku.Ean;
+                    finalSku.MeasurementUnit = rawSku.MeasurementUnit;
+                    finalSku.UnitMultiplier = rawSku.UnitMultiplier ?? 1m;
+
+                    foreach (var rawSeller in rawSku.Sellers)
+                    {
+                        var finalSeller = finalSku.Sellers.FirstOrDefault(s => s.SellerId == rawSeller.SellerId);
+                        if (finalSeller is null)
+                        {
+                            finalSeller = new Seller
+                            {
+                                SellerId = rawSeller.SellerId,
+                                Sku = finalSku
+                            };
+                            finalSku.Sellers.Add(finalSeller);
+                        }
+
+                        finalSeller.SellerName = rawSeller.SellerName;
+                        finalSeller.SellerDefault = rawSeller.SellerDefault;
+
+                        if (rawSeller.LatestOffer is not null)
+                        {
+                            var offer = new CommercialOffer
+                            {
+                                Seller = finalSeller,
+                                Price = rawSeller.LatestOffer.Price ?? 0m,
+                                ListPrice = rawSeller.LatestOffer.ListPrice ?? 0m,
+                                PriceWithoutDiscount = rawSeller.LatestOffer.PriceWithoutDiscount ?? 0m,
+                                AvailableQuantity = rawSeller.LatestOffer.AvailableQuantity ?? 0,
+                                PriceValidUntilUtc = rawSeller.LatestOffer.PriceValidUntilUtc,
+                                CapturedAtUtc = rawSeller.LatestOffer.CapturedAtUtc
+                            };
+                            _db.Offers.Add(offer);
+                        }
                     }
                 }
-
-                // Establecer fecha de release si es la primera vez que vemos el producto
-                if (isNew && vtexProduct.FirstSeenUtc.HasValue)
-                {
-                    product.ReleaseDateUtc = vtexProduct.FirstSeenUtc.Value;
-                }
-
-                // Crear JSON con datos de origen para auditoría
-                var originData = new
-                {
-                    source = "vtex_scraper",
-                    originalCategories = vtexProduct.Categories,
-                    firstSeenInVtex = vtexProduct.FirstSeenUtc,
-                    lastSeenInVtex = vtexProduct.LastSeenUtc,
-                    transcribedAt = DateTime.UtcNow,
-                    transcriptionVersion = "1.0"
-                };
-                product.RawJson = JsonSerializer.Serialize(originData, new JsonSerializerOptions { WriteIndented = false });
-
                 result.ProductsProcessed++;
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Error procesando producto {ProductId} de host {Host}",
-                    vtexProduct.ProductId, host);
+                _log.LogError(ex, "Error procesando producto {ProductId} de host {Host}", rawProduct.ProductId, host);
                 result.ProductsWithErrors++;
             }
         }
 
-        try
-        {
-            // Guardar el lote completo
-            await _db.SaveChangesAsync(ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Error guardando lote para host {Host}", host);
-            // Revertir contadores si falló el guardado
-            var batchSize = batch.Count;
-            result.ProductsProcessed = Math.Max(0, result.ProductsProcessed - batchSize);
-            result.ProductsInserted = Math.Max(0, result.ProductsInserted - batchSize);
-            result.ProductsUpdated = Math.Max(0, result.ProductsUpdated - batchSize);
-            result.ProductsWithErrors += batchSize;
-            throw;
-        }
+        await _db.SaveChangesAsync(ct);
     }
 
-    /// <summary>
-    /// Datos de producto extraídos de las tablas VTEX raw
-    /// </summary>
-    private sealed class VtexProductData
+    private async Task<List<RawProductDto>> GetRawProductDataForBatchAsync(string host, List<int> productIds, CancellationToken ct)
     {
-        public int ProductId { get; set; } = default!;
-        public string? ProductName { get; set; }
-        public string? Brand { get; set; }
-        public string? LinkText { get; set; }
-        public string? Categories { get; set; }
-        public DateTime? FirstSeenUtc { get; set; }
-        public DateTime LastSeenUtc { get; set; }
+        // --- ESTA ES LA CONSULTA CORREGIDA Y COMPLETA ---
+        const string sql = @"
+WITH LastOffer AS (
+    SELECT
+        RetailerHost, SkuId, SellerId, Price, ListPrice, PriceWithoutDiscount, AvailableQuantity, PriceValidUntilUtc, CapturedAtUtc,
+        ROW_NUMBER() OVER(PARTITION BY RetailerHost, SkuId, SellerId ORDER BY CapturedAtUtc DESC) as rn
+    FROM dbo.VtexOffers
+)
+SELECT
+    p.ProductId, p.ProductName, p.Brand, p.LinkText, p.FirstSeenUtc,
+    s.SkuId, s.SkuName, s.Ean, s.MeasurementUnit, s.UnitMultiplier,
+    sel.SellerId, sel.SellerName, sel.SellerDefault,
+    o.Price, o.ListPrice, o.PriceWithoutDiscount, o.AvailableQuantity, o.PriceValidUntilUtc, o.CapturedAtUtc
+FROM dbo.VtexProducts p
+JOIN dbo.VtexSkus s ON p.RetailerHost = s.RetailerHost AND p.ProductId = s.ProductId
+JOIN dbo.VtexSkuSellers sel ON s.RetailerHost = sel.RetailerHost AND s.SkuId = sel.SkuId
+LEFT JOIN LastOffer o ON sel.RetailerHost = o.RetailerHost AND sel.SkuId = o.SkuId AND sel.SellerId = o.SellerId AND o.rn = 1
+WHERE p.RetailerHost = @host AND p.ProductId IN @productIds
+ORDER BY p.ProductId, s.SkuId, sel.SellerId;";
+
+        await using var connection = new SqlConnection(_sqlConn);
+        var rawData = await connection.QueryAsync<dynamic>(sql, new { host, productIds });
+
+        var groupedData = rawData.GroupBy(r => (int)r.ProductId)
+            .Select(pg => new RawProductDto
+            {
+                ProductId = pg.Key,
+                ProductName = pg.First().ProductName,
+                Brand = pg.First().Brand,
+                LinkText = pg.First().LinkText,
+                FirstSeenUtc = pg.First().FirstSeenUtc,
+                Skus = pg.GroupBy(s => (int)s.SkuId).Select(sg => new RawSkuDto
+                {
+                    SkuId = sg.Key,
+                    SkuName = sg.First().SkuName,
+                    Ean = sg.First().Ean,
+                    MeasurementUnit = sg.First().MeasurementUnit,
+                    UnitMultiplier = sg.First().UnitMultiplier,
+                    Sellers = sg.GroupBy(sel => (string)sel.SellerId).Select(selg => new RawSellerDto
+                    {
+                        SellerId = selg.Key,
+                        SellerName = selg.First().SellerName,
+                        SellerDefault = selg.First().SellerDefault,
+                        LatestOffer = selg.First().Price is null ? null : new RawOfferDto
+                        {
+                            Price = selg.First().Price,
+                            ListPrice = selg.First().ListPrice,
+                            PriceWithoutDiscount = selg.First().PriceWithoutDiscount,
+                            AvailableQuantity = selg.First().AvailableQuantity,
+                            PriceValidUntilUtc = selg.First().PriceValidUntilUtc,
+                            CapturedAtUtc = selg.First().CapturedAtUtc
+                        }
+                    }).ToList()
+                }).ToList()
+            }).ToList();
+
+        return groupedData;
     }
 
-    /// <summary>
-    /// Resultado de la operación de transcripción
-    /// </summary>
+    // DTOs
+    private sealed class RawProductDto { public int ProductId { get; set; } public string? ProductName { get; set; } public string? Brand { get; set; } public string? LinkText { get; set; } public DateTime? FirstSeenUtc { get; set; } public List<RawSkuDto> Skus { get; set; } = new(); }
+    private sealed class RawSkuDto { public int SkuId { get; set; } public string? SkuName { get; set; } public string? Ean { get; set; } public string? MeasurementUnit { get; set; } public decimal? UnitMultiplier { get; set; } public List<RawSellerDto> Sellers { get; set; } = new(); }
+    private sealed class RawSellerDto { public string SellerId { get; set; } = ""; public string? SellerName { get; set; } public bool SellerDefault { get; set; } public RawOfferDto? LatestOffer { get; set; } }
+    private sealed class RawOfferDto { public decimal? Price { get; set; } public decimal? ListPrice { get; set; } public decimal? PriceWithoutDiscount { get; set; } public int? AvailableQuantity { get; set; } public DateTime? PriceValidUntilUtc { get; set; } public DateTime CapturedAtUtc { get; set; } }
+
     public sealed class TranscriptionResult
     {
         public string Host { get; set; } = default!;
@@ -243,35 +261,7 @@ public sealed class VtexToProductsTranscriberService
         public string? ErrorMessage { get; set; }
         public DateTime StartedAt { get; set; } = DateTime.UtcNow;
         public DateTime? CompletedAt { get; set; }
-
         public TimeSpan? Duration => CompletedAt.HasValue ? CompletedAt - StartedAt : null;
-
-        public void MarkCompleted()
-        {
-            CompletedAt = DateTime.UtcNow;
-        }
+        public void MarkCompleted() => CompletedAt = DateTime.UtcNow;
     }
 }
-
-// Método de extensión para integrar con tu VtexProductSweepService
-public static class VtexProductSweepServiceExtensions
-{
-    /// <summary>
-    /// Extensión para transcribir productos después del sweep
-    /// </summary>
-    public static async Task<VtexToProductsTranscriberService.TranscriptionResult> TranscribeToProductsAsync(
-        this VtexProductSweepService.SweepResult sweepResult,
-        IServiceProvider serviceProvider,
-        int batchSize = 100,
-        CancellationToken ct = default)
-    {
-        using var scope = serviceProvider.CreateScope();
-        var transcriber = scope.ServiceProvider.GetRequiredService<VtexToProductsTranscriberService>();
-        var result = await transcriber.TranscribeProductsAsync(sweepResult.Host, batchSize, ct);
-        result.MarkCompleted();
-        return result;
-    }
-}
-
-// Para registrar en Program.cs:
-// builder.Services.AddScoped<VtexToProductsTranscriberService>();

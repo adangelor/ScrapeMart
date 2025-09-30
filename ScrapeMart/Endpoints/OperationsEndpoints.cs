@@ -91,7 +91,7 @@ public static class OperationsEndpoints
                    int batchSize = 100,
                    CancellationToken ct = default) =>
             {
-                var result = await service.TranscribeProductsAsync(host, batchSize, ct);
+                var result = await service.TranscribeAllAsync(host, batchSize, ct);
                 return Results.Ok(result);
             })
             .WithName("TranscribeVtexProducts")
