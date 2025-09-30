@@ -432,47 +432,115 @@ public sealed class ImprovedAvailabilityService
 
         return result;
     }
-
     /// <summary>
-    /// 📋 Parsear respuesta de simulación
+    /// 📋 Parsear respuesta de simulación - VERSIÓN CORREGIDA
     /// </summary>
-    private AvailabilityTestResult ParseSimulationResponse(AvailabilityTestResult result, string responseBody)
+    private static AvailabilityTestResult ParseSimulationResponse(AvailabilityTestResult result, string responseBody)
     {
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
 
-            // Verificar disponibilidad en items
-            if (doc.RootElement.TryGetProperty("items", out var items) && items.GetArrayLength() > 0)
+            // 🔍 PASO 1: Verificar disponibilidad en items
+            if (doc.RootElement.TryGetProperty("items", out var items) &&
+                items.ValueKind == JsonValueKind.Array &&
+                items.GetArrayLength() > 0)
             {
                 var item = items[0];
 
-                if (item.TryGetProperty("availability", out var avail) && avail.GetString() == "available")
+                // ✅ CORRECCIÓN 1: Verificar availability correctamente
+                if (item.TryGetProperty("availability", out var avail))
                 {
-                    result.IsAvailable = true;
+                    var availStr = avail.GetString();
+                    // "available" = disponible, "withoutStock" = sin stock, "cannotBeDelivered" = no se puede entregar
+                    result.IsAvailable = availStr == "available";
 
-                    if (item.TryGetProperty("sellingPrice", out var sp) && sp.TryGetDecimal(out var price))
-                        result.Price = price / 100m;
+                    if (availStr == "withoutStock")
+                    {
+                        result.ErrorMessage = "Sin stock";
+                    }
+                    else if (availStr == "cannotBeDelivered")
+                    {
+                        result.ErrorMessage = "No se puede entregar";
+                    }
+                }
 
-                    if (item.TryGetProperty("listPrice", out var lp) && lp.TryGetDecimal(out var listPrice))
-                        result.ListPrice = listPrice / 100m;
+                // ✅ CORRECCIÓN 2: Parse de precios (vienen en CENTAVOS)
+                if (item.TryGetProperty("sellingPrice", out var sp) &&
+                    sp.ValueKind == JsonValueKind.Number)
+                {
+                    var priceInCents = sp.GetDecimal();
+                    result.Price = priceInCents / 100m; // Convertir centavos a pesos
+                }
 
-                    if (item.TryGetProperty("quantity", out var qty) && qty.TryGetInt32(out var quantity))
-                        result.AvailableQuantity = quantity;
+                if (item.TryGetProperty("listPrice", out var lp) &&
+                    lp.ValueKind == JsonValueKind.Number)
+                {
+                    var listPriceInCents = lp.GetDecimal();
+                    result.ListPrice = listPriceInCents / 100m; // Convertir centavos a pesos
+                }
+
+                // ✅ CORRECCIÓN 3: Cantidad disponible
+                if (item.TryGetProperty("quantity", out var qty) &&
+                    qty.ValueKind == JsonValueKind.Number)
+                {
+                    result.AvailableQuantity = qty.GetInt32();
                 }
             }
 
-            // Verificar logística
-            if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) && logistics.GetArrayLength() > 0)
+            // 🔍 PASO 2: Verificar logística para confirmar disponibilidad
+            // (Solo si hay SLAs disponibles, el producto realmente se puede entregar)
+            if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) &&
+                logistics.ValueKind == JsonValueKind.Array &&
+                logistics.GetArrayLength() > 0)
             {
                 var logistic = logistics[0];
-                if (logistic.TryGetProperty("slas", out var slas) && slas.GetArrayLength() > 0)
+
+                if (logistic.TryGetProperty("slas", out var slas) &&
+                    slas.ValueKind == JsonValueKind.Array)
                 {
-                    result.IsAvailable = true; // Si hay SLAs, está disponible
+                    var slasCount = slas.GetArrayLength();
+
+                    if (slasCount > 0)
+                    {
+                        // Si hay SLAs Y el item está marcado como "available", está disponible
+                        // Si NO hay SLAs, NO está disponible (aunque diga "available")
+                        // NO HACER NADA aquí si result.IsAvailable ya es true del paso anterior
+                    }
+                    else
+                    {
+                        // Sin SLAs = sin formas de entrega = NO disponible
+                        result.IsAvailable = false;
+                        if (string.IsNullOrEmpty(result.ErrorMessage))
+                        {
+                            result.ErrorMessage = "Sin opciones de entrega (SLAs vacíos)";
+                        }
+                    }
                 }
             }
 
-            // Moneda
+            // 🔍 PASO 3: Verificar mensajes de error
+            if (doc.RootElement.TryGetProperty("messages", out var messages) &&
+                messages.ValueKind == JsonValueKind.Array &&
+                messages.GetArrayLength() > 0)
+            {
+                var firstMessage = messages[0];
+
+                if (firstMessage.TryGetProperty("text", out var msgText))
+                {
+                    var messageStr = msgText.GetString();
+
+                    // Si hay mensaje de error, NO está disponible
+                    if (firstMessage.TryGetProperty("status", out var status) &&
+                        status.GetString() == "error")
+                    {
+                        result.IsAvailable = false;
+                        result.ErrorMessage = messageStr ?? "Error desconocido";
+                    }
+                }
+            }
+
+            // 🔍 PASO 4: Moneda
             if (doc.RootElement.TryGetProperty("storePreferencesData", out var prefs) &&
                 prefs.TryGetProperty("currencyCode", out var currency))
             {
@@ -482,11 +550,11 @@ public sealed class ImprovedAvailabilityService
         catch (Exception ex)
         {
             result.ErrorMessage = $"Parse error: {ex.Message}";
+            result.IsAvailable = false;
         }
 
         return result;
     }
-
     /// <summary>
     /// 🍪 Configurar cookies sin hardcodear
     /// </summary>
