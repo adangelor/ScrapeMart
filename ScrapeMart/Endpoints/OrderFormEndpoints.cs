@@ -82,7 +82,33 @@ public static class OrderFormEndpoints
             .WithName("TestOrderFormAvailability")
             .WithSummary("Testea disponibilidad usando el flujo real de OrderForm de VTEX")
             .WithDescription("Simula el proceso completo: crear orderForm → agregar items → simular shipping → verificar disponibilidad");
-
+        group.MapPost("/operations/availability/improved-check",
+            async ([FromServices] ImprovedAvailabilityService service,
+                   string? specificHost,
+                   CancellationToken ct) =>
+            {
+                var result = await service.RunComprehensiveCheckAsync(specificHost, ct);
+                return Results.Ok(result);
+            })
+            .WithName("RunImprovedAvailabilityCheck")
+            .WithSummary("🚀 Verificación mejorada de disponibilidad")
+            .WithDescription(@"
+        ✨ MEJORAS PRINCIPALES:
+        
+        ✅ Sin cookies hardcodeadas (usa VtexCookieManager)
+        ✅ Filtra productos con Track = true
+        ✅ Control inteligente de velocidad (throttling)
+        ✅ Usa proxy configurado en appsettings.json
+        ✅ Reintentos automáticos con exponential backoff
+        ✅ Mejor manejo de errores
+        ✅ Logs detallados del progreso
+        
+        📊 PARÁMETROS:
+        - specificHost: (opcional) Procesar solo una cadena específica
+        
+        Ejemplo: POST /operations/availability/improved-check?specificHost=https://www.vea.com.ar
+    ")
+            .WithTags("Availability - Improved");
         return group;
     }
 }

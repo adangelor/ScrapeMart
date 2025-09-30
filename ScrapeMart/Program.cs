@@ -45,7 +45,7 @@ builder.Services.AddScoped<VtexPublicClient>(provider =>
     var httpClientFactory = provider.GetRequiredService<IHttpClientFactory>();
     return new VtexPublicClient(httpClientFactory);
 });
-
+builder.Services.AddScoped<ImprovedAvailabilityService>();
 builder.Services.AddScoped<CatalogSyncService>();
 builder.Services.AddScoped<VtexProductSweepService>();
 builder.Services.AddScoped<VtexSweepService>();

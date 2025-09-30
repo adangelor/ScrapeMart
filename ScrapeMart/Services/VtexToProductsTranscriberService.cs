@@ -1,9 +1,8 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using Dapper;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Entities;
 using ScrapeMart.Storage;
-using System.Text.Json;
-using Dapper;
-using Microsoft.Data.SqlClient;
 
 namespace ScrapeMart.Services;
 

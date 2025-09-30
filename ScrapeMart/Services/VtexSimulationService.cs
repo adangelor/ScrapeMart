@@ -224,40 +224,15 @@ public sealed class VtexSimulationService
     /// </summary>
     private async Task SetupCookiesForRetailer(string host, int salesChannel)
     {
-        // 🍪 COOKIES ESPECÍFICAS POR CADENA
-        if (host.Contains("vea.com.ar"))
-        {
-            var veaCookies = "*vwo*uuid_v2=D141114DDECB39C78FDE0DA2F48546747|2ee47531154585f40ac2bd7c29301e2c; vtex-search-anonymous=5fc9a7ff55844ebeae13ae66986ae76a; checkout.vtex.com=__ofid=938ebb0c94c34808a9e9839b2093bb88; vtex_binding_address=veaargentina.myvtex.com/; *vwo*uuid=DDE37222879064FD7ABC4F579080F9076; *vis*opt_s=1%7C; locale=es-AR; VtexWorkspace=master%3A-; *fbp=fb.2.1758660348137.763496486246645936.Bg; VtexIdclientAutCookie*veaargentina=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; VtexIdclientAutCookie_1e29887f-4d43-484f-b512-2013f42600b1=eyJhbGciOiJFUzI1NiIsImtpZCI6IjYwNzhCMDRGQUNDM0YyREU5NDhBN0IzRDJCOUZCRTg5OTI1Mzg3QjEiLCJ0eXAiOiJqd3QifQ.eyJzdWIiOiJhZGFuZ2Vsb3JAZ21haWwuY29tIiwiYWNjb3VudCI6InZlYWFyZ2VudGluYSIsImF1ZGllbmNlIjoid2Vic3RvcmUiLCJzZXNzIjoiZDJiMDBmOGYtZGIwNy00OWMyLTliNzctOTFhNTQ4YjlkNWYyIiwiZXhwIjoxNzU4NzQ2NzU3LCJ0eXBlIjoidXNlciIsInVzZXJJZCI6ImE4ZmRhZGYwLTBkMTItNGVkYy1hNjkzLWY5OGI0MTQ4ZWFkMiIsImlhdCI6MTc1ODY2MDM1NywiaXNSZXByZXNlbnRhdGl2ZSI6ZmFsc2UsImlzcyI6InRva2VuLWVtaXR0ZXIiLCJqdGkiOiJhNWQ4MWE2Ni1mMzMzLTQ4MzUtYWMzNC0zYjVmZTQ2N2MzZGYifQ.cbPwTE4bg35oigiKLy1LZY5peYVSHYmJkTUzl37l9au7pzr5-Gb5v6BFIP33MDzdfWvcLAJcabLvqIeEZht57w; vtex_session=eyJhbGciOiJFUzI1NiIsImtpZCI6IjhlYjAwZGVkLTJiZTYtNDU5My1hOTM1LTc0M2U5ZGI5ZTJkZSIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50LmlkIjpbXSwiaWQiOiI5OTIyNDY3Zi1kZmVjLTRhZDgtODc5Zi03NjNlNzM5ZTBmZDMiLCJ2ZXJzaW9uIjo0LCJzdWIiOiJzZXNzaW9uIiwiYWNjb3VudCI6InNlc3Npb24iLCJleHAiOjE3NTkzNTE1ODQsImlhdCI6MTc1ODY2MDM4NCwianRpIjoiMGJhMTY2YmYtYmExYS00Y2ZmLWE0NGItNjdmMWU5MzRlNGQwIiwiaXNzIjoic2Vzc2lvbi9kYXRhLXNpZ25lciJ9.ABYU09YDZfGphniwhtUVF8sZBXOlx2LMWiORDwtSuhdgXPrX1NOFa039zaNNtxogfS-V30_5VjkkvkpWRjyZTA; vtex_segment=eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIzNCIsInByaWNlVGFibGVzIjpudWxsLCJyZWdpb25JZCI6IlUxY2phblZ0WW05aGNtZGxiblJwYm1GMk9EWXdjMkZ1YkhWcGN3PT0iLCJ1dG1fY2FtcGFpZ24iOm51bGwsInV0bV9zb3VyY2UiOm51bGwsInV0bWlfY2FtcGFpZ24iOm51bGwsImN1cnJlbmN5Q29kZSI6IkFSUyIsImN1cnJlbmN5U3ltYm9sIjoiJCIsImNvdW50cnlDb2RlIjoiQVJHIiwiY3VsdHVyZUluZm8iOiJlcy1BUiIsImFkbWluX2N1bHR1cmVJbmZvIjoiZXMtQVIiLCJjaGFubmVsUHJpdmFjeSI6InB1YmxpYyJ9; vtex-search-session=5f9a75f8c4aa446a9ae9d8666a223a19; CheckoutOrderFormOwnership=";
-            _cookieManager.SetCookiesForHost(host, veaCookies);
-            _log.LogInformation("🍪 VEA: Cookies específicas configuradas");
-        }
-        else if (host.Contains("jumbo.com.ar"))
-        {
-            // TODO: Agregar cookies de Jumbo cuando las tengas
-            _log.LogInformation("🍪 JUMBO: Usando cookies por defecto (agregar cookies específicas)");
-        }
-        else if (host.Contains("disco.com.ar"))
-        {
-            // TODO: Agregar cookies de Disco cuando las tengas
-            _log.LogInformation("🍪 DISCO: Usando cookies por defecto (agregar cookies específicas)");
-        }
-        else if (host.Contains("dia.com") || host.Contains("diaonline"))
-        {
-            _log.LogInformation("🍪 DIA: Usando cookies por defecto");
-        }
-        else if (host.Contains("carrefour.com.ar"))
-        {
-            _log.LogInformation("🍪 CARREFOUR: Usando cookies por defecto (agregar cookies específicas)");
-        }
-        else
-        {
-            _log.LogInformation("🍪 {Host}: Usando cookies por defecto", host);
-        }
+        _log.LogDebug("🍪 Configurando cookies para {Host} (SC: {SalesChannel})", host, salesChannel);
 
-        // 🔧 ACTUALIZAR SEGMENT COOKIE
+        // Warmup básico - el VtexCookieManager se encarga del resto
+        using var tempClient = CreateClientWithCookieManager(host);
+        await _cookieManager.WarmupCookiesAsync(tempClient, host);
+
+        // Actualizar segment cookie con sales channel correcto
         _cookieManager.UpdateSegmentCookie(host, salesChannel);
     }
-
     /// <summary>
     /// 🍪 Crear HttpClient con cookies del manager
     /// </summary>

@@ -25,8 +25,19 @@ namespace ScrapeMart.Storage
 
         public DbSet<Store> Stores => Set<Store>();
         public DbSet<Retailer> Retailers => Set<Retailer>();
+        public DbSet<AvailabilityResult> AvailabilityResults => Set<AvailabilityResult>(); // ← AGREGAR
+
         protected override void OnModelCreating(ModelBuilder b)
         {
+
+            b.Entity<AvailabilityResult>(e =>
+            {
+                e.HasIndex(x => new { x.RetailerHost, x.StoreId, x.ProductEAN, x.CheckedAt })
+                    .HasDatabaseName("IX_AvailabilityResults_Lookup");
+
+                e.HasIndex(x => x.CheckedAt)
+                    .HasDatabaseName("IX_AvailabilityResults_Date");
+            });
             b.Entity<ProductToTrack>().HasKey(p => p.EAN); // <-- AÑADIR ESTA LÍNEA AL PRINCIPIO
 
             b.Entity<VtexPickupPoint>().HasKey(p => new { p.RetailerHost, p.PickupPointId });
