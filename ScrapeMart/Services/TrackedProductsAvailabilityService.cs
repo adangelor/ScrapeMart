@@ -17,32 +17,23 @@ namespace ScrapeMart.Services;
 /// - Reintentos inteligentes
 /// - Mejor manejo de errores
 /// </summary>
-public sealed class ImprovedAvailabilityService
+public sealed class ImprovedAvailabilityService(
+    IServiceProvider serviceProvider,
+    ILogger<ImprovedAvailabilityService> log,
+    IConfiguration config,
+    IVtexCookieManager cookieManager)
 {
-    private readonly IServiceProvider _serviceProvider;
-    private readonly ILogger<ImprovedAvailabilityService> _log;
-    private readonly string _sqlConn;
-    private readonly IVtexCookieManager _cookieManager;
-    private readonly IConfiguration _config;
+    private readonly IServiceProvider _serviceProvider = serviceProvider;
+    private readonly ILogger<ImprovedAvailabilityService> _log = log;
+    private readonly string _sqlConn = config.GetConnectionString("Default")!;
+    private readonly IVtexCookieManager _cookieManager = cookieManager;
+    private readonly IConfiguration _config = config;
 
     // Configuración de throttling
     private readonly SemaphoreSlim _globalThrottle = new(10, 10); // Max 10 requests simultáneos globalmente
     private readonly Dictionary<string, SemaphoreSlim> _hostThrottles = new(); // 4 requests por host
     private readonly Dictionary<string, DateTime> _lastRequestByHost = new();
     private readonly TimeSpan _minDelayBetweenRequests = TimeSpan.FromMilliseconds(250); // 250ms entre requests al mismo host
-
-    public ImprovedAvailabilityService(
-        IServiceProvider serviceProvider,
-        ILogger<ImprovedAvailabilityService> log,
-        IConfiguration config,
-        IVtexCookieManager cookieManager)
-    {
-        _serviceProvider = serviceProvider;
-        _log = log;
-        _config = config;
-        _cookieManager = cookieManager;
-        _sqlConn = config.GetConnectionString("Default")!;
-    }
 
     /// <summary>
     /// 🚀 MÉTODO PRINCIPAL: Verificación completa con todas las mejoras
@@ -180,7 +171,7 @@ public sealed class ImprovedAvailabilityService
                 retailer.DisplayName);
             return result;
         }
-
+        result.StoresProcessed = stores.Count;
         _log.LogInformation("📍 {RetailerName}: {StoreCount} sucursales para verificar",
             retailer.DisplayName, stores.Count);
 
