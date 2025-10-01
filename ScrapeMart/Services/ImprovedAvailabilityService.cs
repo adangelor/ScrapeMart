@@ -1,6 +1,6 @@
-﻿// File: Services/ImprovedAvailabilityService.cs
-using Microsoft.Data.SqlClient;
+﻿using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using ScrapeMart.Entities.dtos;
 using ScrapeMart.Storage;
 using System.Net;
 using System.Text;
@@ -8,36 +8,29 @@ using System.Text.Json;
 
 namespace ScrapeMart.Services;
 
-/// <summary>
-/// 🚀 Servicio mejorado para verificación masiva de disponibilidad
-/// - Sin cookies hardcodeadas (usa VtexCookieManager)
-/// - Filtra por Track = true
-/// - Control de velocidad (throttling)
-/// - Usa proxy configurado
-/// - Reintentos inteligentes
-/// - Mejor manejo de errores
-/// </summary>
-public sealed class ImprovedAvailabilityService(
-    IServiceProvider serviceProvider,
-    ILogger<ImprovedAvailabilityService> log,
-    IConfiguration config,
-    IVtexCookieManager cookieManager)
+public sealed class ImprovedAvailabilityService
 {
-    private readonly IServiceProvider _serviceProvider = serviceProvider;
-    private readonly ILogger<ImprovedAvailabilityService> _log = log;
-    private readonly string _sqlConn = config.GetConnectionString("Default")!;
-    private readonly IVtexCookieManager _cookieManager = cookieManager;
-    private readonly IConfiguration _config = config;
-
-    // Configuración de throttling
-    private readonly SemaphoreSlim _globalThrottle = new(10, 10); // Max 10 requests simultáneos globalmente
-    private readonly Dictionary<string, SemaphoreSlim> _hostThrottles = new(); // 4 requests por host
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<ImprovedAvailabilityService> _log;
+    private readonly string _sqlConn;
+    private readonly IVtexCookieManager _cookieManager;
+    private readonly SemaphoreSlim _globalThrottle = new(10, 10);
+    private readonly Dictionary<string, SemaphoreSlim> _hostThrottles = new();
     private readonly Dictionary<string, DateTime> _lastRequestByHost = new();
-    private readonly TimeSpan _minDelayBetweenRequests = TimeSpan.FromMilliseconds(250); // 250ms entre requests al mismo host
+    private readonly TimeSpan _minDelayBetweenRequests = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>
-    /// 🚀 MÉTODO PRINCIPAL: Verificación completa con todas las mejoras
-    /// </summary>
+    public ImprovedAvailabilityService(
+        IServiceProvider serviceProvider,
+        ILogger<ImprovedAvailabilityService> log,
+        IConfiguration config,
+        IVtexCookieManager cookieManager)
+    {
+        _serviceProvider = serviceProvider;
+        _log = log;
+        _sqlConn = config.GetConnectionString("Default")!;
+        _cookieManager = cookieManager;
+    }
+
     public async Task<ComprehensiveResult> RunComprehensiveCheckAsync(
         string? specificHost = null,
         CancellationToken ct = default)
@@ -51,20 +44,15 @@ public sealed class ImprovedAvailabilityService(
             await using var scope = _serviceProvider.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDb>();
 
-            // 1️⃣ OBTENER CADENAS HABILITADAS
             var retailers = await GetEnabledRetailersAsync(db, specificHost, ct);
             result.TotalRetailers = retailers.Count;
 
             _log.LogInformation("🏢 Cadenas a procesar: {Count}", retailers.Count);
 
-            // 2️⃣ OBTENER PRODUCTOS CON TRACK = TRUE ✅
             var trackedProducts = await GetTrackedProductsAsync(db, ct);
             result.TotalProductsToTrack = trackedProducts.Count;
 
-            _log.LogInformation("📋 Productos con Track=true: {Count} ({AdecoCount} Adeco, {CompCount} competencia)",
-                trackedProducts.Count,
-                trackedProducts.Count(p => p.Owner == "Adeco"),
-                trackedProducts.Count(p => p.Owner != "Adeco"));
+            _log.LogInformation("📋 Productos con Track=true: {Count}", trackedProducts.Count);
 
             if (trackedProducts.Count == 0)
             {
@@ -73,7 +61,6 @@ public sealed class ImprovedAvailabilityService(
                 return result;
             }
 
-            // 3️⃣ PROCESAR CADA CADENA
             foreach (var retailer in retailers)
             {
                 if (ct.IsCancellationRequested) break;
@@ -103,28 +90,23 @@ public sealed class ImprovedAvailabilityService(
                     };
                 }
 
-                // ⏰ PAUSA ENTRE CADENAS (crucial para no saturar)
                 await Task.Delay(TimeSpan.FromSeconds(5), ct);
             }
 
             result.Success = true;
             result.CompletedAt = DateTime.UtcNow;
 
-            // 4️⃣ REPORTE FINAL
             LogFinalReport(result);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "💥 Error fatal en verificación comprehensiva");
+            _log.LogError(ex, "💥 Error en verificación comprehensiva");
             result.ErrorMessage = ex.Message;
         }
 
         return result;
     }
 
-    /// <summary>
-    /// 🏢 Procesar una cadena específica
-    /// </summary>
     private async Task<RetailerResult> ProcessRetailerAsync(
         RetailerInfo retailer,
         List<ProductToTrack> trackedProducts,
@@ -133,19 +115,15 @@ public sealed class ImprovedAvailabilityService(
         var result = new RetailerResult { RetailerHost = retailer.VtexHost };
         var salesChannel = retailer.SalesChannels.First();
 
-        // 🔧 INICIALIZAR THROTTLE PARA ESTE HOST
         if (!_hostThrottles.ContainsKey(retailer.VtexHost))
         {
-            _hostThrottles[retailer.VtexHost] = new SemaphoreSlim(4, 4); // Max 4 requests simultáneos por host
+            _hostThrottles[retailer.VtexHost] = new SemaphoreSlim(4, 4);
         }
 
-        // 🍪 CONFIGURAR COOKIES USANDO EL MANAGER (sin hardcodear)
         await SetupCookiesAsync(retailer.VtexHost, salesChannel);
 
-        // 🌐 CREAR CLIENTE CON PROXY Y COOKIES
         using var httpClient = CreateHttpClientWithProxyAndCookies(retailer.VtexHost);
 
-        // 🔍 OBTENER PRODUCTOS DISPONIBLES EN ESTA CADENA
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
 
@@ -162,7 +140,6 @@ public sealed class ImprovedAvailabilityService(
         _log.LogInformation("📦 {RetailerName}: {Found}/{Total} productos encontrados",
             retailer.DisplayName, availableProducts.Count, trackedProducts.Count);
 
-        // 📍 OBTENER SUCURSALES
         var stores = await GetStoresForRetailerAsync(db, retailer.RetailerId, ct);
 
         if (stores.Count == 0)
@@ -171,11 +148,11 @@ public sealed class ImprovedAvailabilityService(
                 retailer.DisplayName);
             return result;
         }
+
         result.StoresProcessed = stores.Count;
         _log.LogInformation("📍 {RetailerName}: {StoreCount} sucursales para verificar",
             retailer.DisplayName, stores.Count);
 
-        // 🚀 PROCESAR CON THROTTLING CONTROLADO
         var tasks = new List<Task>();
         var resultsLock = new object();
 
@@ -191,7 +168,6 @@ public sealed class ImprovedAvailabilityService(
 
                 tasks.Add(task);
 
-                // Control de memoria: procesar en batches
                 if (tasks.Count >= 50)
                 {
                     await Task.WhenAll(tasks);
@@ -202,7 +178,6 @@ public sealed class ImprovedAvailabilityService(
             if (ct.IsCancellationRequested) break;
         }
 
-        // Esperar tareas restantes
         if (tasks.Count > 0)
         {
             await Task.WhenAll(tasks);
@@ -211,37 +186,29 @@ public sealed class ImprovedAvailabilityService(
         return result;
     }
 
-    /// <summary>
-    /// 🎯 Procesar un producto en una sucursal CON THROTTLING
-    /// </summary>
     private async Task ProcessProductStoreWithThrottlingAsync(
         HttpClient httpClient,
         RetailerInfo retailer,
         AvailableProduct product,
-        StoreInfo store,
+        ScrapeMart.Entities.dtos.StoreInfo store,
         int salesChannel,
         RetailerResult result,
         object resultsLock,
         CancellationToken ct)
     {
-        // 🔐 THROTTLING GLOBAL
         await _globalThrottle.WaitAsync(ct);
 
         try
         {
-            // 🔐 THROTTLING POR HOST
             await _hostThrottles[retailer.VtexHost].WaitAsync(ct);
 
             try
             {
-                // ⏰ DELAY MÍNIMO ENTRE REQUESTS AL MISMO HOST
                 await EnforceMinimumDelayAsync(retailer.VtexHost);
 
-                // 🧪 TESTEAR DISPONIBILIDAD
                 var availability = await TestAvailabilityWithRetryAsync(
                     httpClient, retailer.VtexHost, salesChannel, product, store, ct);
 
-                // 💾 GUARDAR RESULTADO
                 await SaveAvailabilityResultAsync(
                     retailer.VtexHost, store, product, availability, salesChannel, ct);
 
@@ -250,7 +217,6 @@ public sealed class ImprovedAvailabilityService(
                     result.ProductChecks++;
                     if (availability.IsAvailable) result.AvailableProducts++;
 
-                    // Log cada 100 verificaciones
                     if (result.ProductChecks % 100 == 0)
                     {
                         _log.LogInformation("📊 {RetailerName}: {Completed} verificaciones completadas",
@@ -285,9 +251,6 @@ public sealed class ImprovedAvailabilityService(
         }
     }
 
-    /// <summary>
-    /// ⏰ Asegurar delay mínimo entre requests al mismo host
-    /// </summary>
     private async Task EnforceMinimumDelayAsync(string host)
     {
         lock (_lastRequestByHost)
@@ -298,7 +261,7 @@ public sealed class ImprovedAvailabilityService(
                 if (timeSinceLastRequest < _minDelayBetweenRequests)
                 {
                     var delayNeeded = _minDelayBetweenRequests - timeSinceLastRequest;
-                    Thread.Sleep(delayNeeded); // Bloqueo sincrónico para este host
+                    Thread.Sleep(delayNeeded);
                 }
             }
 
@@ -306,15 +269,12 @@ public sealed class ImprovedAvailabilityService(
         }
     }
 
-    /// <summary>
-    /// 🔄 Testear disponibilidad CON REINTENTOS
-    /// </summary>
     private async Task<AvailabilityTestResult> TestAvailabilityWithRetryAsync(
         HttpClient httpClient,
         string host,
         int salesChannel,
         AvailableProduct product,
-        StoreInfo store,
+        ScrapeMart.Entities.dtos.StoreInfo store,
         CancellationToken ct)
     {
         var maxRetries = 3;
@@ -332,7 +292,7 @@ public sealed class ImprovedAvailabilityService(
 
                 if (attempt < maxRetries)
                 {
-                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt)); // Exponential backoff
+                    var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt));
                     _log.LogWarning("⚠️ Intento {Attempt}/{Max} falló para {Product} en {Store}. Reintentando en {Delay}s...",
                         attempt, maxRetries, product.ProductName, store.StoreName, delay.TotalSeconds);
                     await Task.Delay(delay, ct);
@@ -340,7 +300,6 @@ public sealed class ImprovedAvailabilityService(
             }
         }
 
-        // Si llegamos aquí, todos los intentos fallaron
         return new AvailabilityTestResult
         {
             ProductEan = product.EAN,
@@ -350,15 +309,12 @@ public sealed class ImprovedAvailabilityService(
         };
     }
 
-    /// <summary>
-    /// 🧪 Testear disponibilidad (lógica principal)
-    /// </summary>
     private async Task<AvailabilityTestResult> TestAvailabilityAsync(
         HttpClient httpClient,
         string host,
         int salesChannel,
         AvailableProduct product,
-        StoreInfo store,
+        ScrapeMart.Entities.dtos.StoreInfo store,
         CancellationToken ct)
     {
         var result = new AvailabilityTestResult
@@ -383,7 +339,12 @@ public sealed class ImprovedAvailabilityService(
                     country = "AR",
                     postalCode = store.PostalCode,
                     city = store.City,
-                    state = store.Province
+                    state = store.Province,
+                    street = "Calle",
+                    number = "1",
+                    neighborhood = "",
+                    complement = "",
+                    receiverName = "Test"
                 },
                 logisticsInfo = store.VtexPickupPointId != null ? new[]
                 {
@@ -423,27 +384,22 @@ public sealed class ImprovedAvailabilityService(
 
         return result;
     }
-    /// <summary>
-    /// 📋 Parsear respuesta de simulación - VERSIÓN CORREGIDA
-    /// </summary>
+
     private static AvailabilityTestResult ParseSimulationResponse(AvailabilityTestResult result, string responseBody)
     {
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
 
-            // 🔍 PASO 1: Verificar disponibilidad en items
             if (doc.RootElement.TryGetProperty("items", out var items) &&
                 items.ValueKind == JsonValueKind.Array &&
                 items.GetArrayLength() > 0)
             {
                 var item = items[0];
 
-                // ✅ CORRECCIÓN 1: Verificar availability correctamente
                 if (item.TryGetProperty("availability", out var avail))
                 {
                     var availStr = avail.GetString();
-                    // "available" = disponible, "withoutStock" = sin stock, "cannotBeDelivered" = no se puede entregar
                     result.IsAvailable = availStr == "available";
 
                     if (availStr == "withoutStock")
@@ -456,22 +412,20 @@ public sealed class ImprovedAvailabilityService(
                     }
                 }
 
-                // ✅ CORRECCIÓN 2: Parse de precios (vienen en CENTAVOS)
                 if (item.TryGetProperty("sellingPrice", out var sp) &&
                     sp.ValueKind == JsonValueKind.Number)
                 {
                     var priceInCents = sp.GetDecimal();
-                    result.Price = priceInCents / 100m; // Convertir centavos a pesos
+                    result.Price = priceInCents / 100m;
                 }
 
                 if (item.TryGetProperty("listPrice", out var lp) &&
                     lp.ValueKind == JsonValueKind.Number)
                 {
                     var listPriceInCents = lp.GetDecimal();
-                    result.ListPrice = listPriceInCents / 100m; // Convertir centavos a pesos
+                    result.ListPrice = listPriceInCents / 100m;
                 }
 
-                // ✅ CORRECCIÓN 3: Cantidad disponible
                 if (item.TryGetProperty("quantity", out var qty) &&
                     qty.ValueKind == JsonValueKind.Number)
                 {
@@ -479,8 +433,6 @@ public sealed class ImprovedAvailabilityService(
                 }
             }
 
-            // 🔍 PASO 2: Verificar logística para confirmar disponibilidad
-            // (Solo si hay SLAs disponibles, el producto realmente se puede entregar)
             if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) &&
                 logistics.ValueKind == JsonValueKind.Array &&
                 logistics.GetArrayLength() > 0)
@@ -492,25 +444,17 @@ public sealed class ImprovedAvailabilityService(
                 {
                     var slasCount = slas.GetArrayLength();
 
-                    if (slasCount > 0)
+                    if (slasCount == 0)
                     {
-                        // Si hay SLAs Y el item está marcado como "available", está disponible
-                        // Si NO hay SLAs, NO está disponible (aunque diga "available")
-                        // NO HACER NADA aquí si result.IsAvailable ya es true del paso anterior
-                    }
-                    else
-                    {
-                        // Sin SLAs = sin formas de entrega = NO disponible
                         result.IsAvailable = false;
                         if (string.IsNullOrEmpty(result.ErrorMessage))
                         {
-                            result.ErrorMessage = "Sin opciones de entrega (SLAs vacíos)";
+                            result.ErrorMessage = "Sin opciones de entrega";
                         }
                     }
                 }
             }
 
-            // 🔍 PASO 3: Verificar mensajes de error
             if (doc.RootElement.TryGetProperty("messages", out var messages) &&
                 messages.ValueKind == JsonValueKind.Array &&
                 messages.GetArrayLength() > 0)
@@ -521,7 +465,6 @@ public sealed class ImprovedAvailabilityService(
                 {
                     var messageStr = msgText.GetString();
 
-                    // Si hay mensaje de error, NO está disponible
                     if (firstMessage.TryGetProperty("status", out var status) &&
                         status.GetString() == "error")
                     {
@@ -531,7 +474,6 @@ public sealed class ImprovedAvailabilityService(
                 }
             }
 
-            // 🔍 PASO 4: Moneda
             if (doc.RootElement.TryGetProperty("storePreferencesData", out var prefs) &&
                 prefs.TryGetProperty("currencyCode", out var currency))
             {
@@ -546,24 +488,17 @@ public sealed class ImprovedAvailabilityService(
 
         return result;
     }
-    /// <summary>
-    /// 🍪 Configurar cookies sin hardcodear
-    /// </summary>
+
     private async Task SetupCookiesAsync(string host, int salesChannel)
     {
         _log.LogDebug("🍪 Configurando cookies para {Host} (SC: {SalesChannel})", host, salesChannel);
 
-        // Warmup básico
         using var tempClient = CreateHttpClientWithProxyAndCookies(host);
         await _cookieManager.WarmupCookiesAsync(tempClient, host);
 
-        // Actualizar segment cookie
         _cookieManager.UpdateSegmentCookie(host, salesChannel);
     }
 
-    /// <summary>
-    /// 🌐 Crear HttpClient con PROXY y COOKIES
-    /// </summary>
     private HttpClient CreateHttpClientWithProxyAndCookies(string host)
     {
         var cookieContainer = _cookieManager.GetCookieContainer(host);
@@ -575,22 +510,6 @@ public sealed class ImprovedAvailabilityService(
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
         };
 
-        // 🌐 CONFIGURAR PROXY
-        var proxyUrl = _config["Proxy:Url"];
-        if (!string.IsNullOrEmpty(proxyUrl))
-        {
-            var proxy = new WebProxy(new Uri(proxyUrl));
-            var username = _config["Proxy:Username"];
-            if (!string.IsNullOrEmpty(username))
-            {
-                proxy.Credentials = new NetworkCredential(username, _config["Proxy:Password"]);
-            }
-            handler.Proxy = proxy;
-            handler.UseProxy = true;
-
-            _log.LogDebug("🌐 Usando proxy: {ProxyUrl}", proxyUrl);
-        }
-
         var client = new HttpClient(handler);
         client.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
@@ -601,9 +520,6 @@ public sealed class ImprovedAvailabilityService(
         return client;
     }
 
-    /// <summary>
-    /// 🏢 Obtener cadenas habilitadas
-    /// </summary>
     private async Task<List<RetailerInfo>> GetEnabledRetailersAsync(AppDb db, string? specificHost, CancellationToken ct)
     {
         var rawData = await (
@@ -634,13 +550,10 @@ public sealed class ImprovedAvailabilityService(
         }).ToList();
     }
 
-    /// <summary>
-    /// 📋 Obtener productos CON TRACK = TRUE ✅
-    /// </summary>
     private async Task<List<ProductToTrack>> GetTrackedProductsAsync(AppDb db, CancellationToken ct)
     {
         return await db.ProductsToTrack
-            .Where(p => p.Track.HasValue && p.Track.Value == true) // ✅ FILTRO CRÍTICO
+            .Where(p => p.Track.HasValue && p.Track.Value == true)
             .AsNoTracking()
             .Select(p => new ProductToTrack
             {
@@ -651,9 +564,6 @@ public sealed class ImprovedAvailabilityService(
             .ToListAsync(ct);
     }
 
-    /// <summary>
-    /// 🔍 Obtener productos disponibles en una cadena
-    /// </summary>
     private async Task<List<AvailableProduct>> GetAvailableProductsForRetailerAsync(
         AppDb db, string host, List<ProductToTrack> trackedProducts, CancellationToken ct)
     {
@@ -685,16 +595,13 @@ public sealed class ImprovedAvailabilityService(
             .ToList();
     }
 
-    /// <summary>
-    /// 📍 Obtener sucursales de una cadena
-    /// </summary>
-    private async Task<List<StoreInfo>> GetStoresForRetailerAsync(AppDb db, string retailerId, CancellationToken ct)
+    private async Task<List<ScrapeMart.Entities.dtos.StoreInfo>> GetStoresForRetailerAsync(AppDb db, string retailerId, CancellationToken ct)
     {
         return await db.Stores
             .AsNoTracking()
             .Where(s => s.RetailerId == retailerId && s.IsActive)
             .Where(s => !string.IsNullOrEmpty(s.PostalCode))
-            .Select(s => new StoreInfo
+            .Select(s => new ScrapeMart.Entities.dtos.StoreInfo
             {
                 StoreId = s.StoreId,
                 StoreName = s.StoreName,
@@ -708,12 +615,9 @@ public sealed class ImprovedAvailabilityService(
             .ToListAsync(ct);
     }
 
-    /// <summary>
-    /// 💾 Guardar resultado de disponibilidad
-    /// </summary>
     private async Task SaveAvailabilityResultAsync(
         string host,
-        StoreInfo store,
+        ScrapeMart.Entities.dtos.StoreInfo store,
         AvailableProduct product,
         AvailabilityTestResult availability,
         int salesChannel,
@@ -759,9 +663,6 @@ public sealed class ImprovedAvailabilityService(
         }
     }
 
-    /// <summary>
-    /// 📊 Log del reporte final
-    /// </summary>
     private void LogFinalReport(ComprehensiveResult result)
     {
         _log.LogInformation("🎉 === REPORTE FINAL DE DISPONIBILIDAD ===");
@@ -794,83 +695,4 @@ public sealed class ImprovedAvailabilityService(
         }
     }
 
-    #region DTOs
-
-    private sealed class RetailerInfo
-    {
-        public string RetailerId { get; set; } = default!;
-        public string DisplayName { get; set; } = default!;
-        public string VtexHost { get; set; } = default!;
-        public int[] SalesChannels { get; set; } = Array.Empty<int>();
-        public int StoreCount { get; set; }
-    }
-
-    private sealed class ProductToTrack
-    {
-        public string EAN { get; set; } = default!;
-        public string Owner { get; set; } = default!;
-        public string? ProductName { get; set; }
-    }
-
-    private sealed class AvailableProduct
-    {
-        public string EAN { get; set; } = default!;
-        public string SkuId { get; set; } = default!;
-        public string SellerId { get; set; } = default!;
-        public string ProductName { get; set; } = default!;
-        public string Owner { get; set; } = default!;
-    }
-
-    private sealed class StoreInfo
-    {
-        public long StoreId { get; set; }
-        public string StoreName { get; set; } = default!;
-        public string City { get; set; } = default!;
-        public string Province { get; set; } = default!;
-        public string PostalCode { get; set; } = default!;
-        public string? VtexPickupPointId { get; set; }
-        public double Latitude { get; set; }
-        public double Longitude { get; set; }
-    }
-
-    private sealed class AvailabilityTestResult
-    {
-        public string ProductEan { get; set; } = default!;
-        public string SkuId { get; set; } = default!;
-        public string SellerId { get; set; } = default!;
-        public bool IsAvailable { get; set; }
-        public decimal? Price { get; set; }
-        public decimal? ListPrice { get; set; }
-        public int AvailableQuantity { get; set; }
-        public string Currency { get; set; } = "ARS";
-        public int StatusCode { get; set; }
-        public string? ErrorMessage { get; set; }
-        public string? RawResponse { get; set; }
-    }
-
-    public sealed class RetailerResult
-    {
-        public string RetailerHost { get; set; } = default!;
-        public int StoresProcessed { get; set; }
-        public int ProductChecks { get; set; }
-        public int AvailableProducts { get; set; }
-        public string? ErrorMessage { get; set; }
-    }
-
-    public sealed class ComprehensiveResult
-    {
-        public bool Success { get; set; }
-        public int TotalRetailers { get; set; }
-        public int TotalProductsToTrack { get; set; }
-        public int TotalStoresProcessed { get; set; }
-        public int TotalProductChecks { get; set; }
-        public int TotalAvailableProducts { get; set; }
-        public Dictionary<string, RetailerResult> RetailerResults { get; set; } = new();
-        public DateTime StartedAt { get; set; }
-        public DateTime? CompletedAt { get; set; }
-        public TimeSpan Duration => CompletedAt.HasValue ? CompletedAt.Value - StartedAt : TimeSpan.Zero;
-        public string? ErrorMessage { get; set; }
-    }
-
-    #endregion
 }
