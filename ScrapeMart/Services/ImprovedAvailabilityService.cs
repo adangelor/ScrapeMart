@@ -1,4 +1,6 @@
-﻿using Microsoft.Data.SqlClient;
+﻿// Ruta: ScrapeMart/Services/ImprovedAvailabilityService.cs
+
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Entities.dtos;
 using ScrapeMart.Storage;
@@ -8,17 +10,28 @@ using System.Text.Json;
 
 namespace ScrapeMart.Services;
 
+/// <summary>
+/// 🚀 SERVICIO DEFINITIVO: Verifica disponibilidad de forma completa y robusta.
+/// ✅ Usa Proxy de Bright Data.
+/// ✅ Usa VtexCookieManager para sesiones por host.
+/// ✅ Usa el payload de simulación que SÍ funciona (addressType: "search").
+/// ✅ Extrae el PickupPointId de la respuesta de la simulación.
+/// ✅ Actualiza la tabla dbo.Stores con los nuevos PickupPointId encontrados.
+/// ✅ Parsea los precios correctamente (Price vs ListPrice).
+/// </summary>
 public sealed class ImprovedAvailabilityService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<ImprovedAvailabilityService> _log;
     private readonly string _sqlConn;
     private readonly IVtexCookieManager _cookieManager;
+    private readonly IConfiguration _config; // Necesario para leer la config del proxy
     private readonly SemaphoreSlim _globalThrottle = new(10, 10);
     private readonly Dictionary<string, SemaphoreSlim> _hostThrottles = new();
     private readonly Dictionary<string, DateTime> _lastRequestByHost = new();
     private readonly TimeSpan _minDelayBetweenRequests = TimeSpan.FromMilliseconds(250);
 
+    // --- CONSTRUCTOR CORREGIDO ---
     public ImprovedAvailabilityService(
         IServiceProvider serviceProvider,
         ILogger<ImprovedAvailabilityService> log,
@@ -27,8 +40,9 @@ public sealed class ImprovedAvailabilityService
     {
         _serviceProvider = serviceProvider;
         _log = log;
+        _config = config; // Inyectado
         _sqlConn = config.GetConnectionString("Default")!;
-        _cookieManager = cookieManager;
+        _cookieManager = cookieManager; // Inyectado
     }
 
     public async Task<ComprehensiveResult> RunComprehensiveCheckAsync(
@@ -36,9 +50,9 @@ public sealed class ImprovedAvailabilityService
         CancellationToken ct = default)
     {
         var result = new ComprehensiveResult { StartedAt = DateTime.UtcNow };
+        _log.LogInformation("🚀 === INICIANDO VERIFICACIÓN COMPREHENSIVA (VERSIÓN DEFINITIVA) ===");
 
-        _log.LogInformation("🚀 === INICIANDO VERIFICACIÓN COMPREHENSIVA MEJORADA ===");
-
+        // ... (el resto del método se mantiene igual, ya que la lógica principal es correcta)
         try
         {
             await using var scope = _serviceProvider.CreateAsyncScope();
@@ -112,6 +126,7 @@ public sealed class ImprovedAvailabilityService
         List<ProductToTrack> trackedProducts,
         CancellationToken ct)
     {
+        // ... (este método también se mantiene, ya que su lógica es correcta)
         var result = new RetailerResult { RetailerHost = retailer.VtexHost };
         var salesChannel = retailer.SalesChannels.First();
 
@@ -185,6 +200,237 @@ public sealed class ImprovedAvailabilityService
 
         return result;
     }
+
+    // --- HttpClient con Proxy y Cookies (Corregido) ---
+    private HttpClient CreateHttpClientWithProxyAndCookies(string host)
+    {
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var proxyConfig = _config.GetSection("Proxy");
+
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var proxyUrl = proxyConfig["Url"];
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            var proxy = new WebProxy(new Uri(proxyUrl));
+            var username = proxyConfig["Username"];
+            if (!string.IsNullOrEmpty(username))
+            {
+                proxy.Credentials = new NetworkCredential(username, proxyConfig["Password"]);
+            }
+            handler.Proxy = proxy;
+            handler.UseProxy = true;
+        }
+
+        var client = new HttpClient(handler);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 1.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
+        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
+        client.Timeout = TimeSpan.FromSeconds(30);
+
+        return client;
+    }
+
+    // --- TestAvailabilityAsync con Payload y Lógica de Simulación (Corregido) ---
+    private async Task<AvailabilityTestResult> TestAvailabilityAsync(
+        HttpClient httpClient,
+        string host,
+        int salesChannel,
+        AvailableProduct product,
+        ScrapeMart.Entities.dtos.StoreInfo store,
+        CancellationToken ct)
+    {
+        var result = new AvailabilityTestResult
+        {
+            ProductEan = product.EAN,
+            SkuId = product.SkuId,
+            SellerId = product.SellerId
+        };
+
+        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
+
+        var addressPayload = new
+        {
+            country = "ARG",
+            addressType = "search",
+            addressId = "simulation",
+            geoCoordinates = new[] { store.Longitude, store.Latitude }
+        };
+
+        var payload = new
+        {
+            country = "ARG",
+            items = new[] { new { id = product.SkuId, quantity = 1, seller = product.SellerId } },
+            shippingData = new
+            {
+                address = addressPayload,
+                clearAddressIfPostalCodeNotFound = false,
+                selectedAddresses = new[] { addressPayload }
+            }
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+
+        request.Headers.Add("Referer", host + "/");
+        request.Headers.Add("x-requested-with", "XMLHttpRequest");
+
+        using var response = await httpClient.SendAsync(request, ct);
+        var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+        result.RawResponse = responseBody;
+        result.StatusCode = (int)response.StatusCode;
+
+        if (response.IsSuccessStatusCode)
+        {
+            result = ParseSimulationResponse(result, responseBody);
+        }
+        else
+        {
+            if (responseBody.Contains("CHK003")) result.ErrorMessage = "CHK003 - Bloqueado";
+            else if (responseBody.Contains("CHK002")) result.ErrorMessage = "CHK002 - Request inválido";
+            else result.ErrorMessage = $"HTTP {response.StatusCode}";
+        }
+
+        return result;
+    }
+
+    // --- ParseSimulationResponse con Extracción de PickupPointId y Precios (Corregido) ---
+    private static AvailabilityTestResult ParseSimulationResponse(AvailabilityTestResult result, string responseBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(responseBody);
+
+            if (doc.RootElement.TryGetProperty("items", out var items) &&
+                items.ValueKind == JsonValueKind.Array &&
+                items.GetArrayLength() > 0)
+            {
+                var item = items[0];
+
+                if (item.TryGetProperty("availability", out var avail))
+                {
+                    var availStr = avail.GetString();
+                    result.IsAvailable = availStr == "available";
+                    if (availStr == "withoutStock") result.ErrorMessage = "Sin stock";
+                    else if (availStr == "cannotBeDelivered") result.ErrorMessage = "No se puede entregar";
+                }
+
+                if (item.TryGetProperty("sellingPrice", out var sp) && sp.ValueKind == JsonValueKind.Number)
+                    result.Price = sp.GetDecimal() / 100m;
+
+                if (item.TryGetProperty("price", out var p) && p.ValueKind == JsonValueKind.Number)
+                    result.ListPrice = p.GetDecimal() / 100m;
+
+                if (item.TryGetProperty("quantity", out var qty) && qty.ValueKind == JsonValueKind.Number)
+                    result.AvailableQuantity = qty.GetInt32();
+            }
+
+            if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) &&
+                logistics.ValueKind == JsonValueKind.Array &&
+                logistics.GetArrayLength() > 0)
+            {
+                var logistic = logistics[0];
+                if (logistic.TryGetProperty("slas", out var slas) && slas.ValueKind == JsonValueKind.Array)
+                {
+                    var pickupSla = slas.EnumerateArray()
+                        .FirstOrDefault(sla => sla.TryGetProperty("deliveryChannel", out var dc) && dc.GetString() == "pickup-in-point");
+
+                    if (pickupSla.ValueKind != JsonValueKind.Undefined && pickupSla.TryGetProperty("pickupPointId", out var ppId))
+                    {
+                        result.FoundPickupPointId = ppId.GetString();
+                    }
+                }
+            }
+
+            if (doc.RootElement.TryGetProperty("storePreferencesData", out var prefs) &&
+                prefs.TryGetProperty("currencyCode", out var currency))
+            {
+                result.Currency = currency.GetString() ?? "ARS";
+            }
+        }
+        catch (Exception ex)
+        {
+            result.ErrorMessage = $"Parse error: {ex.Message}";
+            result.IsAvailable = false;
+        }
+
+        return result;
+    }
+
+    // --- SaveAvailabilityResultAsync con Actualización de dbo.Stores (Corregido) ---
+    private async Task SaveAvailabilityResultAsync(
+        string host,
+        ScrapeMart.Entities.dtos.StoreInfo store,
+        AvailableProduct product,
+        AvailabilityTestResult availability,
+        int salesChannel,
+        CancellationToken ct)
+    {
+        const string availabilitySql = @"
+            MERGE dbo.VtexStoreAvailability AS T
+            USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
+            ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
+            WHEN MATCHED THEN
+              UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, ListPrice=@listPrice, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
+            WHEN NOT MATCHED THEN
+              INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,ListPrice,Currency,CapturedAtUtc,RawJson,ErrorMessage)
+              VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@listPrice,@curr,SYSUTCDATETIME(),@raw,@error);";
+
+        try
+        {
+            await using var connection = new SqlConnection(_sqlConn);
+            await connection.OpenAsync(ct);
+
+            var pickupPointToSave = availability.FoundPickupPointId
+                                   ?? store.VtexPickupPointId
+                                   ?? store.StoreId.ToString();
+
+            await using (var command = new SqlCommand(availabilitySql, connection))
+            {
+                command.Parameters.AddWithValue("@pp", pickupPointToSave);
+                command.Parameters.AddWithValue("@host", host);
+                command.Parameters.AddWithValue("@sku", product.SkuId);
+                command.Parameters.AddWithValue("@seller", product.SellerId);
+                command.Parameters.AddWithValue("@sc", salesChannel);
+                command.Parameters.AddWithValue("@country", "AR");
+                command.Parameters.AddWithValue("@postal", store.PostalCode);
+                command.Parameters.AddWithValue("@avail", availability.IsAvailable);
+                command.Parameters.AddWithValue("@maxQty", availability.AvailableQuantity);
+                command.Parameters.AddWithValue("@price", (object?)availability.Price ?? DBNull.Value);
+                command.Parameters.AddWithValue("@listPrice", (object?)availability.ListPrice ?? DBNull.Value);
+                command.Parameters.AddWithValue("@curr", availability.Currency ?? "ARS");
+                command.Parameters.AddWithValue("@raw", (object?)availability.RawResponse?.Substring(0, Math.Min(availability.RawResponse.Length, 4000)) ?? DBNull.Value);
+                command.Parameters.AddWithValue("@error", (object?)availability.ErrorMessage ?? DBNull.Value);
+                await command.ExecuteNonQueryAsync(ct);
+            }
+
+            if (!string.IsNullOrEmpty(availability.FoundPickupPointId) && store.VtexPickupPointId != availability.FoundPickupPointId)
+            {
+                _log.LogInformation("📢 ¡Nuevo PickupPointId encontrado! Actualizando Store {StoreId}: {PickupId}", store.StoreId, availability.FoundPickupPointId);
+                const string updateStoreSql = "UPDATE dbo.Stores SET VtexPickupPointId = @pickupId, LastVtexSync = GETUTCDATE() WHERE StoreId = @storeId";
+                await using (var updateCmd = new SqlCommand(updateStoreSql, connection))
+                {
+                    updateCmd.Parameters.AddWithValue("@pickupId", availability.FoundPickupPointId);
+                    updateCmd.Parameters.AddWithValue("@storeId", store.StoreId);
+                    await updateCmd.ExecuteNonQueryAsync(ct);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Error guardando resultado para {Product} en {Store}", product.ProductName, store.StoreName);
+        }
+    }
+
+    // --- El resto de los métodos (helpers para throttling, carga de datos, etc.) no necesitan cambios y se mantienen ---
 
     private async Task ProcessProductStoreWithThrottlingAsync(
         HttpClient httpClient,
@@ -309,215 +555,12 @@ public sealed class ImprovedAvailabilityService
         };
     }
 
-    private async Task<AvailabilityTestResult> TestAvailabilityAsync(
-        HttpClient httpClient,
-        string host,
-        int salesChannel,
-        AvailableProduct product,
-        ScrapeMart.Entities.dtos.StoreInfo store,
-        CancellationToken ct)
-    {
-        var result = new AvailabilityTestResult
-        {
-            ProductEan = product.EAN,
-            SkuId = product.SkuId,
-            SellerId = product.SellerId
-        };
-
-        var url = $"{host.TrimEnd('/')}/api/checkout/pub/orderForms/simulation?sc={salesChannel}";
-
-        var payload = new
-        {
-            items = new[] { new { id = product.SkuId, quantity = 1, seller = product.SellerId } },
-            country = "AR",
-            postalCode = store.PostalCode,
-            shippingData = new
-            {
-                address = new
-                {
-                    addressType = store.VtexPickupPointId != null ? "pickup" : "residential",
-                    country = "AR",
-                    postalCode = store.PostalCode,
-                    city = store.City,
-                    state = store.Province,
-                    street = "Calle",
-                    number = "1",
-                    neighborhood = "",
-                    complement = "",
-                    receiverName = "Test"
-                },
-                logisticsInfo = store.VtexPickupPointId != null ? new[]
-                {
-                    new
-                    {
-                        itemIndex = 0,
-                        selectedSla = store.VtexPickupPointId,
-                        selectedDeliveryChannel = "pickup-in-point"
-                    }
-                } : null
-            }
-        };
-
-        var json = JsonSerializer.Serialize(payload);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-        using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
-
-        request.Headers.Add("Referer", host + "/");
-        request.Headers.Add("x-requested-with", "XMLHttpRequest");
-
-        using var response = await httpClient.SendAsync(request, ct);
-        var responseBody = await response.Content.ReadAsStringAsync(ct);
-
-        result.RawResponse = responseBody;
-        result.StatusCode = (int)response.StatusCode;
-
-        if (response.IsSuccessStatusCode)
-        {
-            result = ParseSimulationResponse(result, responseBody);
-        }
-        else
-        {
-            if (responseBody.Contains("CHK003")) result.ErrorMessage = "CHK003 - Bloqueado";
-            else if (responseBody.Contains("CHK002")) result.ErrorMessage = "CHK002 - Request inválido";
-            else result.ErrorMessage = $"HTTP {response.StatusCode}";
-        }
-
-        return result;
-    }
-
-    private static AvailabilityTestResult ParseSimulationResponse(AvailabilityTestResult result, string responseBody)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(responseBody);
-
-            if (doc.RootElement.TryGetProperty("items", out var items) &&
-                items.ValueKind == JsonValueKind.Array &&
-                items.GetArrayLength() > 0)
-            {
-                var item = items[0];
-
-                if (item.TryGetProperty("availability", out var avail))
-                {
-                    var availStr = avail.GetString();
-                    result.IsAvailable = availStr == "available";
-
-                    if (availStr == "withoutStock")
-                    {
-                        result.ErrorMessage = "Sin stock";
-                    }
-                    else if (availStr == "cannotBeDelivered")
-                    {
-                        result.ErrorMessage = "No se puede entregar";
-                    }
-                }
-
-                if (item.TryGetProperty("sellingPrice", out var sp) &&
-                    sp.ValueKind == JsonValueKind.Number)
-                {
-                    var priceInCents = sp.GetDecimal();
-                    result.Price = priceInCents / 100m;
-                }
-
-                if (item.TryGetProperty("listPrice", out var lp) &&
-                    lp.ValueKind == JsonValueKind.Number)
-                {
-                    var listPriceInCents = lp.GetDecimal();
-                    result.ListPrice = listPriceInCents / 100m;
-                }
-
-                if (item.TryGetProperty("quantity", out var qty) &&
-                    qty.ValueKind == JsonValueKind.Number)
-                {
-                    result.AvailableQuantity = qty.GetInt32();
-                }
-            }
-
-            if (doc.RootElement.TryGetProperty("logisticsInfo", out var logistics) &&
-                logistics.ValueKind == JsonValueKind.Array &&
-                logistics.GetArrayLength() > 0)
-            {
-                var logistic = logistics[0];
-
-                if (logistic.TryGetProperty("slas", out var slas) &&
-                    slas.ValueKind == JsonValueKind.Array)
-                {
-                    var slasCount = slas.GetArrayLength();
-
-                    if (slasCount == 0)
-                    {
-                        result.IsAvailable = false;
-                        if (string.IsNullOrEmpty(result.ErrorMessage))
-                        {
-                            result.ErrorMessage = "Sin opciones de entrega";
-                        }
-                    }
-                }
-            }
-
-            if (doc.RootElement.TryGetProperty("messages", out var messages) &&
-                messages.ValueKind == JsonValueKind.Array &&
-                messages.GetArrayLength() > 0)
-            {
-                var firstMessage = messages[0];
-
-                if (firstMessage.TryGetProperty("text", out var msgText))
-                {
-                    var messageStr = msgText.GetString();
-
-                    if (firstMessage.TryGetProperty("status", out var status) &&
-                        status.GetString() == "error")
-                    {
-                        result.IsAvailable = false;
-                        result.ErrorMessage = messageStr ?? "Error desconocido";
-                    }
-                }
-            }
-
-            if (doc.RootElement.TryGetProperty("storePreferencesData", out var prefs) &&
-                prefs.TryGetProperty("currencyCode", out var currency))
-            {
-                result.Currency = currency.GetString() ?? "ARS";
-            }
-        }
-        catch (Exception ex)
-        {
-            result.ErrorMessage = $"Parse error: {ex.Message}";
-            result.IsAvailable = false;
-        }
-
-        return result;
-    }
-
     private async Task SetupCookiesAsync(string host, int salesChannel)
     {
         _log.LogDebug("🍪 Configurando cookies para {Host} (SC: {SalesChannel})", host, salesChannel);
-
         using var tempClient = CreateHttpClientWithProxyAndCookies(host);
         await _cookieManager.WarmupCookiesAsync(tempClient, host);
-
         _cookieManager.UpdateSegmentCookie(host, salesChannel);
-    }
-
-    private HttpClient CreateHttpClientWithProxyAndCookies(string host)
-    {
-        var cookieContainer = _cookieManager.GetCookieContainer(host);
-
-        var handler = new HttpClientHandler
-        {
-            CookieContainer = cookieContainer,
-            UseCookies = true,
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
-        };
-
-        var client = new HttpClient(handler);
-        client.DefaultRequestHeaders.UserAgent.ParseAdd(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
-        client.DefaultRequestHeaders.Add("Accept", "application/json, text/plain, */*");
-        client.DefaultRequestHeaders.Add("Accept-Language", "es-AR,es;q=0.9,en;q=0.8");
-        client.Timeout = TimeSpan.FromSeconds(30);
-
-        return client;
     }
 
     private async Task<List<RetailerInfo>> GetEnabledRetailersAsync(AppDb db, string? specificHost, CancellationToken ct)
@@ -613,54 +656,6 @@ public sealed class ImprovedAvailabilityService
                 Longitude = (double)s.Longitude
             })
             .ToListAsync(ct);
-    }
-
-    private async Task SaveAvailabilityResultAsync(
-        string host,
-        ScrapeMart.Entities.dtos.StoreInfo store,
-        AvailableProduct product,
-        AvailabilityTestResult availability,
-        int salesChannel,
-        CancellationToken ct)
-    {
-        const string sql = @"
-            MERGE dbo.VtexStoreAvailability AS T
-            USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
-            ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
-            WHEN MATCHED THEN
-              UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
-            WHEN NOT MATCHED THEN
-              INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,Currency,CapturedAtUtc,RawJson,ErrorMessage)
-              VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@curr,SYSUTCDATETIME(),@raw,@error);";
-
-        try
-        {
-            await using var connection = new SqlConnection(_sqlConn);
-            await connection.OpenAsync(ct);
-
-            await using var command = new SqlCommand(sql, connection);
-            command.Parameters.AddWithValue("@host", host);
-            command.Parameters.AddWithValue("@pp", store.VtexPickupPointId ?? store.StoreId.ToString());
-            command.Parameters.AddWithValue("@sku", product.SkuId);
-            command.Parameters.AddWithValue("@seller", product.SellerId);
-            command.Parameters.AddWithValue("@sc", salesChannel);
-            command.Parameters.AddWithValue("@country", "AR");
-            command.Parameters.AddWithValue("@postal", store.PostalCode);
-            command.Parameters.AddWithValue("@avail", availability.IsAvailable);
-            command.Parameters.AddWithValue("@maxQty", availability.AvailableQuantity);
-            command.Parameters.AddWithValue("@price", (object?)availability.Price ?? DBNull.Value);
-            command.Parameters.AddWithValue("@curr", availability.Currency ?? "ARS");
-            command.Parameters.AddWithValue("@raw",
-                (object?)availability.RawResponse?.Substring(0, Math.Min(availability.RawResponse.Length, 4000)) ?? DBNull.Value);
-            command.Parameters.AddWithValue("@error", (object?)availability.ErrorMessage ?? DBNull.Value);
-
-            await command.ExecuteNonQueryAsync(ct);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Error guardando resultado para {Product} en {Store}",
-                product.ProductName, store.StoreName);
-        }
     }
 
     private void LogFinalReport(ComprehensiveResult result)

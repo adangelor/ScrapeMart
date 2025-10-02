@@ -1,22 +1,32 @@
-﻿using Microsoft.Data.SqlClient;
+﻿// Ruta: ScrapeMart/Services/VtexSweepService.cs
+
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Entities;
 using ScrapeMart.Storage;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
 namespace ScrapeMart.Services;
 
+/// <summary>
+/// 🚀 SERVICIO CORREGIDO: Mapea sucursales físicas a pickup points online.
+/// ✅ Usa Proxy de Bright Data.
+/// ✅ Usa VtexCookieManager para sesiones por host.
+/// ✅ Usa el payload de simulación que SÍ funciona.
+/// </summary>
 public sealed class VtexSweepService
 {
-    private readonly IHttpClientFactory _http;
+    private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<VtexSweepService> _log;
     private readonly string _sqlConn;
     private readonly AppDb _db;
+    private readonly IVtexCookieManager _cookieManager;
+    private readonly IConfiguration _config;
 
-    // Cache por host del SKU y seller de prueba para no pegar mil veces al search
     private readonly ConcurrentDictionary<string, (string SkuId, string SellerId)> _probeCache = new();
 
     private static readonly JsonSerializerOptions Jso = new(JsonSerializerDefaults.Web)
@@ -24,15 +34,55 @@ public sealed class VtexSweepService
         PropertyNameCaseInsensitive = true
     };
 
-    public VtexSweepService(IHttpClientFactory http,
-        ILogger<VtexSweepService> log, IConfiguration cfg,
-        AppDb appDb)
+    public VtexSweepService(
+        IHttpClientFactory httpFactory,
+        ILogger<VtexSweepService> log,
+        IConfiguration cfg,
+        AppDb appDb,
+        IVtexCookieManager cookieManager)
     {
         _db = appDb;
-        _http = http;
+        _httpFactory = httpFactory;
         _log = log;
         _sqlConn = cfg.GetConnectionString("Default")!;
+        _cookieManager = cookieManager;
+        _config = cfg;
     }
+
+    private HttpClient CreateConfiguredHttpClient(string host)
+    {
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var proxyConfig = _config.GetSection("Proxy");
+
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var proxyUrl = proxyConfig["Url"];
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            var proxy = new WebProxy(new Uri(proxyUrl));
+            var username = proxyConfig["Username"];
+            if (!string.IsNullOrEmpty(username))
+            {
+                proxy.Credentials = new NetworkCredential(username, proxyConfig["Password"]);
+            }
+            handler.Proxy = proxy;
+            handler.UseProxy = true;
+            _log.LogDebug("Usando proxy para {Host}", host);
+        }
+
+        var client = new HttpClient(handler);
+        client.Timeout = TimeSpan.FromSeconds(90);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+
+        return client;
+    }
+
 
     public async Task<int> SweepAsync(string? hostFilter = null, int[]? scCandidates = null, int? top = null, CancellationToken ct = default)
     {
@@ -47,7 +97,7 @@ public sealed class VtexSweepService
             {
                 _log.LogInformation("SALTANDO SWEEP para {Host}. El último barrido exitoso fue hace menos de 7 días (el {Date}).",
                     hostFilter, lastSuccessfulSweep.CompletedAtUtc.Value.ToLocalTime());
-                return 0; // No se ejecuta ninguna operación
+                return 0;
             }
         }
         var rows = await LoadWorkAsync(hostFilter, top, ct);
@@ -63,18 +113,14 @@ public sealed class VtexSweepService
         {
             _db.SweepLogs.Add(logEntry);
             await _db.SaveChangesAsync(ct);
-            var http = _http.CreateClient("vtexSession");
-            http.Timeout = TimeSpan.FromSeconds(90);
-
-            http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36");
-
-
-            http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
-
-
 
             foreach (var r in rows)
             {
+                using var http = CreateConfiguredHttpClient(r.Host);
+
+                _log.LogInformation("🍪 Haciendo Warmup de cookies para {Host}", r.Host);
+                await _cookieManager.WarmupCookiesAsync(http, r.Host, ct);
+
                 int[] channelsToSweep = [.. r.SalesChannels
                                      .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                                      .Select(s => int.TryParse(s, out var i) ? i : -1)
@@ -82,11 +128,13 @@ public sealed class VtexSweepService
 
                 if (channelsToSweep.Length == 0)
                 {
-                    channelsToSweep = scCandidates ?? new[] { 1 };
+                    channelsToSweep = scCandidates ?? [1];
                 }
 
                 foreach (var sc in channelsToSweep)
                 {
+                    _cookieManager.UpdateSegmentCookie(r.Host, sc);
+
                     var pickupsFound = 0;
                     var sellersFound = 0;
 
@@ -96,7 +144,7 @@ public sealed class VtexSweepService
                         var urlGeo = $"{r.Host}/api/checkout/pub/pickup-points?geoCoordinates={geo}&sc={sc}";
                         var found = await DiscoverPickupAsync(http, r, sc, "geo", r.Long, r.Lat, null, urlGeo, ct);
                         pickupsFound += found;
-                   
+
                         if (!string.IsNullOrWhiteSpace(r.Postal))
                         {
                             var urlPostal = $"{r.Host}/api/checkout/pub/pickup-points?postalCode={Uri.EscapeDataString(r.Postal!)}&countryCode=AR&sc={sc}";
@@ -115,7 +163,7 @@ public sealed class VtexSweepService
                         var probe = await GetProbeSkuAsync(http, r.Host, sc, ct);
                         if (probe is not null)
                         {
-                            await DiscoverStoresViaSimulationAsync(http, r, sc, r.Postal, null, probe.Value.SkuId, probe.Value.SellerId, ct);
+                            await DiscoverStoresViaSimulationAsync(http, r, sc, r.Postal, r.City, r.Province, null, probe.Value.SkuId, probe.Value.SellerId, ct);
                         }
                     }
 
@@ -135,9 +183,36 @@ public sealed class VtexSweepService
         finally
         {
             logEntry.CompletedAtUtc = DateTime.UtcNow;
-            await _db.SaveChangesAsync(ct); // Guardamos el estado final del log (Success, Failed)
+            await _db.SaveChangesAsync(ct);
         }
         return totalOps;
+    }
+
+    private async Task DiscoverStoresViaSimulationAsync(HttpClient http, WorkRow r, int sc, string? postal, string? city, string? province, string? regionId, string skuId, string sellerId, CancellationToken ct)
+    {
+        var baseUrl = new StringBuilder($"{r.Host}/api/checkout/pub/orderForms/simulation?sc={sc}");
+        if (!string.IsNullOrWhiteSpace(regionId)) { baseUrl.Append($"&regionId={Uri.EscapeDataString(regionId)}"); }
+
+        object payload;
+        if (r.Lat.HasValue && r.Long.HasValue)
+        {
+            var addressPayload = new { country = "ARG", addressType = "search", addressId = "simulation", geoCoordinates = new[] { r.Long.Value, r.Lat.Value } };
+            payload = new { country = "ARG", items = new[] { new { id = skuId, quantity = 1, seller = sellerId } }, shippingData = new { address = addressPayload, clearAddressIfPostalCodeNotFound = false, selectedAddresses = new[] { addressPayload } } };
+        }
+        else
+        {
+            payload = new { country = "ARG", postalCode = postal, items = new[] { new { id = skuId, quantity = 1, seller = sellerId } }, shippingData = new { address = new { addressType = "residential", country = "ARG", postalCode = postal, city = city, state = province } } };
+        }
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl.ToString())
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload, Jso), Encoding.UTF8, "application/json")
+        };
+        using var resp = await http.SendAsync(req, ct);
+        var lastStatus = (int)resp.StatusCode;
+        var lastJson = await resp.Content.ReadAsStringAsync(ct);
+        var found = await ParseAndPersistPickupsFromSimulationAsync(r, lastJson, ct);
+        await InsertPickupDiscoveryAsync(r, sc, "sim", r.Long, r.Lat, postal, lastStatus, found, TruncateForDb(lastJson, 8000), ct);
     }
 
     private async Task<int> DiscoverPickupAsync(HttpClient http, WorkRow r, int sc, string method, double? lon, double? lat, string? postal, string url, CancellationToken ct)
@@ -256,38 +331,6 @@ public sealed class VtexSweepService
 
         await InsertPickupDiscoveryAsync(r, sc, "regions", null, null, postal, status, sellers.Count, TruncateForDb(json, 8000), ct);
         return sellers.Count;
-    }
-
-    private async Task DiscoverStoresViaSimulationAsync(HttpClient http, WorkRow r, int sc, string? postal, string? regionId, string skuId, string sellerId, CancellationToken ct)
-    {
-        var baseUrl = new StringBuilder($"{r.Host}/api/checkout/pub/orderForms/simulation?sc={sc}");
-        if (!string.IsNullOrWhiteSpace(regionId)) { baseUrl.Append($"&regionId={Uri.EscapeDataString(regionId)}"); }
-
-        var attempts = new List<object>
-        {
-            new { country = "ARG", postalCode = postal, items = new[] { new { id = skuId, quantity = 1, seller = sellerId } } },
-            new { country = "AR", postalCode = postal, items = new[] { new { id = skuId, quantity = 1, seller = sellerId } } },
-            new { country = "ARG", postalCode = postal, items = new[] { new { id = skuId, quantity = 1, seller = sellerId } },
-                shippingData = new {
-                    address = new { addressType = "residential", country = "ARG", postalCode = postal, regionId = regionId, city = "", state = "", street = "", number = "", complement = "", receiverName = "" },
-                    selectedAddresses = Array.Empty<object>()
-                }
-            }
-        };
-
-        foreach (var payload in attempts)
-        {
-            using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl.ToString())
-            {
-                Content = new StringContent(JsonSerializer.Serialize(payload, Jso), Encoding.UTF8, "application/json")
-            };
-            using var resp = await http.SendAsync(req, ct);
-            var lastStatus = (int)resp.StatusCode;
-            var lastJson = await resp.Content.ReadAsStringAsync(ct);
-            var found = await ParseAndPersistPickupsFromSimulationAsync(r, lastJson, ct);
-            await InsertPickupDiscoveryAsync(r, sc, "sim", null, null, postal, lastStatus, found, TruncateForDb(lastJson, 8000), ct);
-            if (found > 0 || resp.IsSuccessStatusCode) break;
-        }
     }
 
     private async Task<int> ParseAndPersistPickupsFromSimulationAsync(WorkRow r, string json, CancellationToken ct)
@@ -459,25 +502,28 @@ VALUES
     {
         var list = new List<WorkRow>();
         var sql = new StringBuilder(@"
-SELECT " + (top.HasValue ? $"TOP ({top.Value})" : "TOP (10000)") + @"
-    cfg.IdBandera, cfg.IdComercio,
-    cfg.RetailerHost AS Host,
-    cfg.SalesChannels AS SalesChannels,
-    s.IdSucursal,
-    NULLIF(LTRIM(RTRIM(s.SucursalesCodigoPostal)), '') AS Postal,
-    CASE WHEN s.SucursalesLongitud = 0 THEN NULL ELSE s.SucursalesLongitud END AS Lon,
-    CASE WHEN s.SucursalesLatitud  = 0 THEN NULL ELSE s.SucursalesLatitud  END AS Lat
-FROM dbo.VtexRetailersConfig cfg
-JOIN dbo.Sucursales s ON s.IdBandera = cfg.IdBandera AND s.IdComercio = cfg.IdComercio
-WHERE cfg.Enabled=1
+SELECT " + (top.HasValue ? $"TOP ({top.Value})" : "") + @"
+    r.SourceIdBandera AS IdBandera, 
+    r.SourceIdComercio AS IdComercio,
+    r.VtexHost AS Host,
+    r.SalesChannels AS SalesChannels,
+    s.StoreId AS IdSucursal,
+    s.PostalCode AS Postal,
+    s.Longitude AS Lon,
+    s.Latitude AS Lat,
+    s.City,
+    s.Province
+FROM dbo.Retailers r
+JOIN dbo.Stores s ON r.RetailerId = s.RetailerId
+WHERE r.IsActive=1 AND s.IsActive=1
 ");
 
         if (!string.IsNullOrWhiteSpace(hostFilter))
         {
-            sql.Append("AND cfg.RetailerHost = @host ");
+            sql.Append("AND r.VtexHost = @host ");
         }
 
-        sql.Append("ORDER BY cfg.IdBandera, cfg.IdComercio, s.IdSucursal;");
+        sql.Append("ORDER BY r.VtexHost, s.StoreId;");
         await using var cn = new SqlConnection(_sqlConn);
         await cn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql.ToString(), cn);
@@ -488,14 +534,16 @@ WHERE cfg.Enabled=1
         {
             list.Add(new WorkRow
             {
-                IdBandera = rd.GetInt32(0),
-                IdComercio = rd.GetInt32(1),
-                Host = rd.GetString(2),
-                SalesChannels = rd.GetString(3),
-                IdSucursal = rd.GetInt32(4),
-                Postal = rd.IsDBNull(5) ? null : rd.GetString(5),
-                Long = rd.IsDBNull(6) ? null : rd.GetDouble(6),
-                Lat = rd.IsDBNull(7) ? null : rd.GetDouble(7),
+                IdBandera = rd.GetInt32(rd.GetOrdinal("IdBandera")),
+                IdComercio = rd.GetInt32(rd.GetOrdinal("IdComercio")),
+                Host = rd.GetString(rd.GetOrdinal("Host")),
+                SalesChannels = rd.GetString(rd.GetOrdinal("SalesChannels")),
+                IdSucursal = (int)rd.GetInt64(rd.GetOrdinal("IdSucursal")),
+                Postal = rd.IsDBNull(rd.GetOrdinal("Postal")) ? null : rd.GetString(rd.GetOrdinal("Postal")),
+                Long = rd.IsDBNull(rd.GetOrdinal("Lon")) ? null : (double?)rd.GetDecimal(rd.GetOrdinal("Lon")),
+                Lat = rd.IsDBNull(rd.GetOrdinal("Lat")) ? null : (double?)rd.GetDecimal(rd.GetOrdinal("Lat")),
+                City = rd.IsDBNull(rd.GetOrdinal("City")) ? null : rd.GetString(rd.GetOrdinal("City")),
+                Province = rd.IsDBNull(rd.GetOrdinal("Province")) ? null : rd.GetString(rd.GetOrdinal("Province")),
             });
         }
         return list;
@@ -514,5 +562,7 @@ WHERE cfg.Enabled=1
         public string? Postal { get; set; }
         public double? Long { get; set; }
         public double? Lat { get; set; }
+        public string? City { get; set; }
+        public string? Province { get; set; }
     }
 }

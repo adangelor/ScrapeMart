@@ -7,6 +7,8 @@
         public string City { get; set; } = default!;
         public string Province { get; set; } = default!;
         public string PostalCode { get; set; } = default!;
+        public string Street { get; set; } = default!;
+        public string Number { get; set; } = default!;
         public string? VtexPickupPointId { get; set; }
         public double Latitude { get; set; }
         public double Longitude { get; set; }

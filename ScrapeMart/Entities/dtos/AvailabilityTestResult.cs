@@ -12,6 +12,7 @@
         public string Currency { get; set; } = "ARS";
         public int StatusCode { get; set; }
         public string? ErrorMessage { get; set; }
+        public string? FoundPickupPointId { get; set; }
         public string? RawResponse { get; set; }
     }
 

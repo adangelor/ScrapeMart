@@ -1,4 +1,6 @@
-﻿namespace ScrapeMart.Entities;
+﻿// Ruta: ScrapeMart/Entities/ProductAvailabilityReport.cs
+
+namespace ScrapeMart.Entities;
 
 public class ProductAvailabilityReport
 {
@@ -10,8 +12,11 @@ public class ProductAvailabilityReport
     public string? Empresa { get; set; }
     public string? TipoTienda { get; set; }
     public string? Tienda { get; set; }
-    public double SucursalesLatitud { get; set; }
-    public double SucursalesLongitud { get; set; }
+
+    // --- 👇 CORRECCIÓN ACÁ 👇 ---
+    public decimal SucursalesLatitud { get; set; } // Cambiado de double a decimal
+    public decimal SucursalesLongitud { get; set; } // Cambiado de double a decimal
+    // --- 👆 FIN DE LA CORRECCIÓN 👆 ---
 
     // Info de la Captura
     public DateTime Fecha { get; set; }
@@ -23,7 +28,8 @@ public class ProductAvailabilityReport
     public string? Subcategoria { get; set; }
     public string? Categoria3 { get; set; }
     public string? Producto { get; set; }
-    //PRECIOS
+
+    // PRECIOS
     public decimal? PrecioVenta { get; set; }
     public decimal? PrecioLista { get; set; }
     public decimal? PrecioPromocion { get; set; }

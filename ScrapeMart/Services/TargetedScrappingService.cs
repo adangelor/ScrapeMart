@@ -1,31 +1,85 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿// Ruta: ScrapeMart/Services/TargetedScrapingService.cs
+
+using Microsoft.EntityFrameworkCore;
 using ScrapeMart.Storage;
-using System.Text;
+using System.Net;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace ScrapeMart.Services;
 
+/// <summary>
+/// 🚀 SERVICIO RECONTRA-CORREGIDO: Scraping dirigido por EAN.
+/// ✅ Abandona el GraphQL frágil y usa la API REST estándar (/api/catalog_system/pub/products/search).
+/// ✅ Usa Proxy de Bright Data.
+/// ✅ Usa VtexCookieManager para sesiones por host.
+/// </summary>
 public sealed class TargetedScrapingService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<TargetedScrapingService> _log;
+    private readonly IVtexCookieManager _cookieManager;
+    private readonly IConfiguration _config;
 
-    public TargetedScrapingService(IServiceProvider serviceProvider, ILogger<TargetedScrapingService> log)
+    public TargetedScrapingService(
+        IServiceProvider serviceProvider,
+        ILogger<TargetedScrapingService> log,
+        IVtexCookieManager cookieManager,
+        IConfiguration config)
     {
         _serviceProvider = serviceProvider;
         _log = log;
+        _cookieManager = cookieManager;
+        _config = config;
+    }
+
+    private HttpClient CreateConfiguredHttpClient(string host)
+    {
+        var cookieContainer = _cookieManager.GetCookieContainer(host);
+        var proxyConfig = _config.GetSection("Proxy");
+
+        var handler = new HttpClientHandler()
+        {
+            CookieContainer = cookieContainer,
+            UseCookies = true,
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli
+        };
+
+        var proxyUrl = proxyConfig["Url"];
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            var proxy = new WebProxy(new Uri(proxyUrl));
+            var username = proxyConfig["Username"];
+            if (!string.IsNullOrEmpty(username))
+            {
+                proxy.Credentials = new NetworkCredential(username, proxyConfig["Password"]);
+            }
+            handler.Proxy = proxy;
+            handler.UseProxy = true;
+        }
+
+        var client = new HttpClient(handler);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+        return client;
     }
 
     public async Task ScrapeByEanListAsync(string host, CancellationToken ct)
     {
-        _log.LogInformation("Iniciando scraping dirigido por EAN (método GraphQL) para {Host}", host);
+        _log.LogInformation("Iniciando scraping dirigido por EAN (método REST API) para {Host}", host);
 
         await using var scope = _serviceProvider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDb>();
         var syncService = scope.ServiceProvider.GetRequiredService<CatalogSyncService>();
-        var httpClient = scope.ServiceProvider.GetRequiredService<IHttpClientFactory>().CreateClient("vtexSession");
 
-        var eansToScrape = await db.ProductsToTrack.AsNoTracking().Select(p => p.EAN).ToListAsync(ct);
+        using var httpClient = CreateConfiguredHttpClient(host);
+        await _cookieManager.WarmupCookiesAsync(httpClient, host, ct);
+
+        var eansToScrape = await db.ProductsToTrack
+            .Where(p => p.Track == true)
+            .AsNoTracking()
+            .Select(p => p.EAN)
+            .ToListAsync(ct);
+
         _log.LogInformation("Se buscarán {EanCount} EANs de la tabla de seguimiento.", eansToScrape.Count);
 
         int productsFound = 0;
@@ -39,28 +93,39 @@ public sealed class TargetedScrapingService
 
             try
             {
-                // --- ¡ESTA ES LA LÓGICA BASADA EN TU URL! ---
-                var variablesJson = $"{{\"fullText\":\"{ean}\"}}";
-                var base64Variables = Convert.ToBase64String(Encoding.UTF8.GetBytes(variablesJson));
+                // --- 👇 EL CAMBIO ESTÁ ACÁ: USAMOS LA API REST DIRECTA 👇 ---
+                var searchUrl = $"{host.TrimEnd('/')}/api/catalog_system/pub/products/search?ft={ean}&_from=0&_to=0";
 
-                // Usamos los parámetros fijos de la URL que encontraste
-                const string sha256Hash = "0a16ef70d196958d57b5bd650cb3c3486598d7054b3e6b8c6376afc94d0ad621";
-                const string sender = "vtex.store-resources@0.x";
-                const string provider = "vtex.search-graphql@0.x";
+                var response = await httpClient.GetAsync(searchUrl, ct);
 
-                var extensions = $"{{\"persistedQuery\":{{\"version\":1,\"sha256Hash\":\"{sha256Hash}\",\"sender\":\"{sender}\",\"provider\":\"{provider}\"}},\"variables\":\"{base64Variables}\"}}";
+                if (!response.IsSuccessStatusCode)
+                {
+                    _log.LogWarning("La búsqueda para el EAN {EAN} falló con status {StatusCode}", ean, response.StatusCode);
+                    continue;
+                }
 
-                var url = $"{host.TrimEnd('/')}/_v/segment/graphql/v1?workspace=master&maxAge=medium&operationName=autocompleteSearchSuggestions&variables=%7B%7D&extensions={Uri.EscapeDataString(extensions)}";
+                var json = await response.Content.ReadAsStringAsync(ct);
 
-                var responseString = await httpClient.GetStringAsync(url, ct);
+                if (string.IsNullOrEmpty(json) || json == "[]")
+                {
+                    _log.LogWarning("No se encontró producto para el EAN {EAN} en la respuesta de la API REST.", ean);
+                    continue;
+                }
 
-                // El JSON de GraphQL viene anidado, tenemos que desarmarlo
-                var gqlResponse = JsonNode.Parse(responseString);
-                var productNode = gqlResponse?["data"]?["productSearch"]?["products"]?.AsArray().FirstOrDefault()?.AsObject();
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0)
+                {
+                    _log.LogWarning("La respuesta para el EAN {EAN} no es un array de productos válido.", ean);
+                    continue;
+                }
+
+                // Tomamos el primer producto del array de resultados
+                var productNode = JsonObject.Parse(doc.RootElement[0].GetRawText())?.AsObject();
+                // --- 👆 FIN DEL CAMBIO 👆 ---
 
                 if (productNode is null)
                 {
-                    _log.LogWarning("No se encontró producto para el EAN {EAN} en la respuesta de GraphQL.", ean);
+                    _log.LogWarning("No se pudo parsear el nodo del producto para el EAN {EAN}", ean);
                     continue;
                 }
 
@@ -73,7 +138,7 @@ public sealed class TargetedScrapingService
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Falló la búsqueda GraphQL para el EAN {EAN}", ean);
+                _log.LogError(ex, "Falló la búsqueda REST para el EAN {EAN}", ean);
             }
         }
         _log.LogInformation("Scraping dirigido finalizado. Se encontraron y guardaron {Count} productos.", productsFound);
