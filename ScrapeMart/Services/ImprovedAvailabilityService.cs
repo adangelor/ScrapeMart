@@ -238,7 +238,7 @@ public sealed class ImprovedAvailabilityService
     }
 
     // --- TestAvailabilityAsync con Payload y Lógica de Simulación (Corregido) ---
-    private async Task<AvailabilityTestResult> TestAvailabilityAsync(
+    public async Task<AvailabilityTestResult> TestAvailabilityAsync(
         HttpClient httpClient,
         string host,
         int salesChannel,
@@ -367,22 +367,32 @@ public sealed class ImprovedAvailabilityService
 
     // --- SaveAvailabilityResultAsync con Actualización de dbo.Stores (Corregido) ---
     private async Task SaveAvailabilityResultAsync(
-        string host,
-        ScrapeMart.Entities.dtos.StoreInfo store,
-        AvailableProduct product,
-        AvailabilityTestResult availability,
-        int salesChannel,
-        CancellationToken ct)
+      string host,
+      ScrapeMart.Entities.dtos.StoreInfo store,
+      AvailableProduct product,
+      AvailabilityTestResult availability,
+      int salesChannel,
+      CancellationToken ct)
     {
         const string availabilitySql = @"
-            MERGE dbo.VtexStoreAvailability AS T
-            USING (VALUES(@host,@pp,@sku,@seller,@sc)) AS S (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel)
-            ON (T.RetailerHost=S.RetailerHost AND T.PickupPointId=S.PickupPointId AND T.SkuId=S.SkuId AND T.SellerId=S.SellerId AND T.SalesChannel=S.SalesChannel)
-            WHEN MATCHED THEN
-              UPDATE SET IsAvailable=@avail, MaxFeasibleQty=@maxQty, Price=@price, ListPrice=@listPrice, Currency=@curr, CountryCode=@country, PostalCode=@postal, CapturedAtUtc=SYSUTCDATETIME(), RawJson=@raw, ErrorMessage=@error
-            WHEN NOT MATCHED THEN
-              INSERT (RetailerHost,PickupPointId,SkuId,SellerId,SalesChannel,CountryCode,PostalCode,IsAvailable,MaxFeasibleQty,Price,ListPrice,Currency,CapturedAtUtc,RawJson,ErrorMessage)
-              VALUES (@host,@pp,@sku,@seller,@sc,@country,@postal,@avail,@maxQty,@price,@listPrice,@curr,SYSUTCDATETIME(),@raw,@error);";
+        MERGE dbo.VtexStoreAvailability AS T
+        USING (SELECT @host AS RetailerHost, @pp AS PickupPointId, @sku AS SkuId, @seller AS SellerId, @sc AS SalesChannel, @capturedAt AS CapturedAtUtc) AS S
+        ON (T.RetailerHost = S.RetailerHost AND T.PickupPointId = S.PickupPointId AND T.SkuId = S.SkuId AND T.SellerId = S.SellerId AND T.SalesChannel = S.SalesChannel)
+        WHEN MATCHED AND T.CapturedAtUtc < S.CapturedAtUtc THEN
+          UPDATE SET 
+            IsAvailable=@avail, 
+            MaxFeasibleQty=@maxQty, 
+            Price=@price, 
+            ListPrice=@listPrice, 
+            Currency=@curr, 
+            CountryCode=@country, 
+            PostalCode=@postal, 
+            CapturedAtUtc=@capturedAt, 
+            RawJson=@raw, 
+            ErrorMessage=@error
+        WHEN NOT MATCHED THEN
+          INSERT (RetailerHost, PickupPointId, SkuId, SellerId, SalesChannel, CountryCode, PostalCode, IsAvailable, MaxFeasibleQty, Price, ListPrice, Currency, CapturedAtUtc, RawJson, ErrorMessage)
+          VALUES (@host, @pp, @sku, @seller, @sc, @country, @postal, @avail, @maxQty, @price, @listPrice, @curr, @capturedAt, @raw, @error);";
 
         try
         {
@@ -392,6 +402,8 @@ public sealed class ImprovedAvailabilityService
             var pickupPointToSave = availability.FoundPickupPointId
                                    ?? store.VtexPickupPointId
                                    ?? store.StoreId.ToString();
+
+            var capturedAt = DateTime.UtcNow;
 
             await using (var command = new SqlCommand(availabilitySql, connection))
             {
@@ -409,6 +421,7 @@ public sealed class ImprovedAvailabilityService
                 command.Parameters.AddWithValue("@curr", availability.Currency ?? "ARS");
                 command.Parameters.AddWithValue("@raw", (object?)availability.RawResponse?.Substring(0, Math.Min(availability.RawResponse.Length, 4000)) ?? DBNull.Value);
                 command.Parameters.AddWithValue("@error", (object?)availability.ErrorMessage ?? DBNull.Value);
+                command.Parameters.AddWithValue("@capturedAt", capturedAt);
                 await command.ExecuteNonQueryAsync(ct);
             }
 
@@ -429,7 +442,6 @@ public sealed class ImprovedAvailabilityService
             _log.LogError(ex, "Error guardando resultado para {Product} en {Store}", product.ProductName, store.StoreName);
         }
     }
-
     // --- El resto de los métodos (helpers para throttling, carga de datos, etc.) no necesitan cambios y se mantienen ---
 
     private async Task ProcessProductStoreWithThrottlingAsync(

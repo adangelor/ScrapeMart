@@ -295,4 +295,10 @@ public sealed record StoreInfo
     public string Province { get; init; } = default!;
     public long StoreId { get; init; }
     public string RetailerId { get; init; } = default!;
+    public string StoreName { get; internal set; }
+    public string? VtexPickupPointId { get; internal set; }
+    public double Longitude { get; internal set; }
+    public double Latitude { get; internal set; }
+    public string Street { get; internal set; }
+    public string Number { get; internal set; }
 }
