@@ -6,7 +6,7 @@ using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ===== CONFIGURACIÓN DE SERVICIOS =====
+// ===== CONFIGURACIï¿½N DE SERVICIOS =====
 
 // Base services
 builder.Services.AddControllers();
@@ -61,6 +61,7 @@ builder.Services.AddScoped<ComprehensiveAvailabilityService>();
 builder.Services.AddScoped<OptimizedAvailabilityService>();
 builder.Services.AddScoped<BasicDebuggingService>();
 builder.Services.AddCatalogQueryService();
+builder.Services.AddPriceQueryService();
 builder.Services.AddScoped<VtexEndpointTesterService>();
 builder.Services.AddScoped<WorkingVtexFlowService>();
 builder.Services.AddScoped<VtexOrderFormService>();
@@ -74,7 +75,7 @@ builder.Services.AddScoped<VtexProductDiscoveryService>();
 
 var app = builder.Build();
 
-// ===== CONFIGURACIÓN DEL PIPELINE =====
+// ===== CONFIGURACIï¿½N DEL PIPELINE =====
 
 if (app.Environment.IsDevelopment())
 {
@@ -92,6 +93,12 @@ var catalogGroup = app.MapGroup("/api/catalog")
     .WithTags("Catalog")
     .WithOpenApi();
 catalogGroup.MapCatalogEndpoints();
+
+// Price endpoints
+var priceGroup = app.MapGroup("/api/prices")
+    .WithTags("Prices")
+    .WithOpenApi();
+priceGroup.MapPriceEndpoints();
 
 // Retailer availability endpoints
 app.MapRetailerAvailabilityEndpoints();

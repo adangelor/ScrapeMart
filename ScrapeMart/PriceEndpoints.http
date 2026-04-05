@@ -1,0 +1,16 @@
+### Obtener precios por EAN en una sucursal específica
+GET {{host}}/api/prices/by-ean/7790895001234/retailer/vea.com.ar/store/1001
+Accept: application/json
+
+### Obtener precios por EAN en todas las sucursales de una cadena
+GET {{host}}/api/prices/by-ean/7790895001234/retailer/vea.com.ar
+Accept: application/json
+
+### Ejemplo con otro retailer (ajustar según tus datos)
+GET {{host}}/api/prices/by-ean/7790895001234/retailer/jumbo.com.ar/store/2001
+Accept: application/json
+
+### Variables de entorno para las pruebas
+@host = https://localhost:7001
+
+###

@@ -365,7 +365,6 @@ public sealed class ImprovedAvailabilityService
         return result;
     }
 
-    // --- SaveAvailabilityResultAsync con Actualización de dbo.Stores (Corregido) ---
     private async Task SaveAvailabilityResultAsync(
       string host,
       ScrapeMart.Entities.dtos.StoreInfo store,
@@ -374,25 +373,32 @@ public sealed class ImprovedAvailabilityService
       int salesChannel,
       CancellationToken ct)
     {
+        // --- CONSULTA SQL MODIFICADA ---
+        // La clave está en el "ON", donde ahora también comparamos la fecha.
         const string availabilitySql = @"
-        MERGE dbo.VtexStoreAvailability AS T
-        USING (SELECT @host AS RetailerHost, @pp AS PickupPointId, @sku AS SkuId, @seller AS SellerId, @sc AS SalesChannel, @capturedAt AS CapturedAtUtc) AS S
-        ON (T.RetailerHost = S.RetailerHost AND T.PickupPointId = S.PickupPointId AND T.SkuId = S.SkuId AND T.SellerId = S.SellerId AND T.SalesChannel = S.SalesChannel)
-        WHEN MATCHED AND T.CapturedAtUtc < S.CapturedAtUtc THEN
-          UPDATE SET 
-            IsAvailable=@avail, 
-            MaxFeasibleQty=@maxQty, 
-            Price=@price, 
-            ListPrice=@listPrice, 
-            Currency=@curr, 
-            CountryCode=@country, 
-            PostalCode=@postal, 
-            CapturedAtUtc=@capturedAt, 
-            RawJson=@raw, 
-            ErrorMessage=@error
-        WHEN NOT MATCHED THEN
-          INSERT (RetailerHost, PickupPointId, SkuId, SellerId, SalesChannel, CountryCode, PostalCode, IsAvailable, MaxFeasibleQty, Price, ListPrice, Currency, CapturedAtUtc, RawJson, ErrorMessage)
-          VALUES (@host, @pp, @sku, @seller, @sc, @country, @postal, @avail, @maxQty, @price, @listPrice, @curr, @capturedAt, @raw, @error);";
+    MERGE dbo.VtexStoreAvailability AS T
+    USING (SELECT @host AS RetailerHost, @pp AS PickupPointId, @sku AS SkuId, @seller AS SellerId, @sc AS SalesChannel) AS S
+    ON (
+        T.RetailerHost = S.RetailerHost AND
+        T.PickupPointId = S.PickupPointId AND
+        T.SkuId = S.SkuId AND
+        T.SellerId = S.SellerId AND
+        T.SalesChannel = S.SalesChannel AND
+        CONVERT(date, T.CapturedAtUtc) = CONVERT(date, @capturedAt)
+    )
+    WHEN MATCHED THEN
+      UPDATE SET
+        IsAvailable=@avail,
+        MaxFeasibleQty=@maxQty,
+        Price=@price,
+        ListPrice=@listPrice,
+        Currency=@curr,
+        CapturedAtUtc=@capturedAt,
+        RawJson=@raw,
+        ErrorMessage=@error
+    WHEN NOT MATCHED THEN
+      INSERT (RetailerHost, PickupPointId, SkuId, SellerId, SalesChannel, CountryCode, PostalCode, IsAvailable, MaxFeasibleQty, Price, ListPrice, Currency, CapturedAtUtc, RawJson, ErrorMessage)
+      VALUES (@host, @pp, @sku, @seller, @sc, @country, @postal, @avail, @maxQty, @price, @listPrice, @curr, @capturedAt, @raw, @error);";
 
         try
         {
@@ -407,6 +413,8 @@ public sealed class ImprovedAvailabilityService
 
             await using (var command = new SqlCommand(availabilitySql, connection))
             {
+                // Se añade el parámetro @capturedAt para usarlo en la condición del MERGE
+                command.Parameters.AddWithValue("@capturedAt", capturedAt);
                 command.Parameters.AddWithValue("@pp", pickupPointToSave);
                 command.Parameters.AddWithValue("@host", host);
                 command.Parameters.AddWithValue("@sku", product.SkuId);
@@ -421,7 +429,6 @@ public sealed class ImprovedAvailabilityService
                 command.Parameters.AddWithValue("@curr", availability.Currency ?? "ARS");
                 command.Parameters.AddWithValue("@raw", (object?)availability.RawResponse?.Substring(0, Math.Min(availability.RawResponse.Length, 4000)) ?? DBNull.Value);
                 command.Parameters.AddWithValue("@error", (object?)availability.ErrorMessage ?? DBNull.Value);
-                command.Parameters.AddWithValue("@capturedAt", capturedAt);
                 await command.ExecuteNonQueryAsync(ct);
             }
 
@@ -441,8 +448,7 @@ public sealed class ImprovedAvailabilityService
         {
             _log.LogError(ex, "Error guardando resultado para {Product} en {Store}", product.ProductName, store.StoreName);
         }
-    }
-    // --- El resto de los métodos (helpers para throttling, carga de datos, etc.) no necesitan cambios y se mantienen ---
+    }    // --- El resto de los métodos (helpers para throttling, carga de datos, etc.) no necesitan cambios y se mantienen ---
 
     private async Task ProcessProductStoreWithThrottlingAsync(
         HttpClient httpClient,
@@ -575,7 +581,7 @@ public sealed class ImprovedAvailabilityService
         _cookieManager.UpdateSegmentCookie(host, salesChannel);
     }
 
-    private async Task<List<RetailerInfo>> GetEnabledRetailersAsync(AppDb db, string? specificHost, CancellationToken ct)
+    private static async Task<List<RetailerInfo>> GetEnabledRetailersAsync(AppDb db, string? specificHost, CancellationToken ct)
     {
         var rawData = await (
             from retailer in db.Retailers.AsNoTracking()
@@ -605,7 +611,7 @@ public sealed class ImprovedAvailabilityService
         }).ToList();
     }
 
-    private async Task<List<ProductToTrack>> GetTrackedProductsAsync(AppDb db, CancellationToken ct)
+    private static async Task<List<ProductToTrack>> GetTrackedProductsAsync(AppDb db, CancellationToken ct)
     {
         return await db.ProductsToTrack
             .Where(p => p.Track.HasValue && p.Track.Value == true)
